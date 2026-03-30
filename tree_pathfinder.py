@@ -695,14 +695,32 @@ class PassiveTree:
         return conflicting
 
     # ── Keystone mutual-exclusion rules ──────────────────────────────────────
-    # Stats text patterns that identify a keystone as "no-crit" or "crit-reliant"
-    _NO_CRIT_KS_STATS = [
-        "never deal critical strikes",        # Resolute Technique
-        "critical strikes do not deal extra", # Elemental Overload
-    ]
-    _CRIT_STAT_KEYWORDS = [
-        "critical strike chance",
-        "critical strike multiplier",
+    # Each entry describes a keystone that is incompatible with a class of nodes.
+    #   keystone_stats   — substrings in the keystone's own stats_text
+    #   conflict_stats   — substrings in stats_text of nodes that are wasted
+    #   ban_from_padding — if True, also forbid conflicting nodes from padding
+    #                      (use when the investment is completely wasted, e.g. crit
+    #                       with RT). Set False when a small amount is still fine
+    #                      (e.g. some life on a Ghost Reaver build is OK).
+    _KEYSTONE_INCOMPATIBILITIES = [
+        {
+            "keystone_stats": [
+                "never deal critical strikes",        # Resolute Technique
+                "critical strikes do not deal extra", # Elemental Overload
+            ],
+            "conflict_stats": ["critical strike chance", "critical strike multiplier"],
+            "ban_from_padding": True,
+        },
+        {
+            "keystone_stats": ["leech energy shield instead of life"],  # Ghost Reaver
+            "conflict_stats": ["maximum life"],
+            "ban_from_padding": False,  # some life pool is still fine on a GR build
+        },
+        {
+            "keystone_stats": ["maximum life becomes 1"],  # Chaos Inoculation
+            "conflict_stats": ["maximum life"],
+            "ban_from_padding": True,  # life investment is completely wasted with CI
+        },
     ]
 
     def _handle_keystone_conflicts(self,
@@ -712,50 +730,55 @@ class PassiveTree:
         """
         Detect mutually exclusive keystones in the target list and resolve them.
 
-        Rule — Resolute Technique / Elemental Overload vs crit investment:
-          • If RT/EO AND crit notables are both requested: drop RT/EO (prefer
-            keeping the more specific crit investment Claude chose).
-          • If only RT/EO is requested: add every crit node on the main tree
-            to extra_forbidden so pathfinding and padding never touch them.
+        For each incompatibility rule:
+          • If both the keystone AND conflicting notables are requested → drop
+            the keystone (prefer keeping the more specific stat investment).
+          • If only the keystone is present and ban_from_padding is True → add
+            every conflicting node on the main tree to extra_forbidden so
+            pathfinding and padding never touch them.
         """
-        no_crit_ids = [
-            nid for nid in target_ids
-            if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
-                   for kw in self._NO_CRIT_KS_STATS)
-        ]
-        crit_target_ids = [
-            nid for nid in target_ids
-            if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
-                   for kw in self._CRIT_STAT_KEYWORDS)
-        ]
+        for rule in self._KEYSTONE_INCOMPATIBILITIES:
+            ks_stats = rule["keystone_stats"]
+            cf_stats = rule["conflict_stats"]
+            ban = rule["ban_from_padding"]
 
-        if not no_crit_ids:
-            return  # no RT/EO — nothing to do
+            ks_ids = [
+                nid for nid in target_ids
+                if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
+                       for kw in ks_stats)
+            ]
+            if not ks_ids:
+                continue  # this keystone not present — skip rule
 
-        if crit_target_ids:
-            # Both RT/EO and crit notables requested — drop RT/EO
-            for nid in no_crit_ids:
-                name = self.node_info.get(nid, {}).get("name", str(nid))
-                logger.warning(
-                    f"Dropping '{name}' — conflicts with crit notables in target list"
+            conflict_target_ids = [
+                nid for nid in target_ids
+                if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
+                       for kw in cf_stats)
+            ]
+
+            if conflict_target_ids:
+                # Both keystone and conflicting notables requested — drop the keystone
+                for nid in ks_ids:
+                    name = self.node_info.get(nid, {}).get("name", str(nid))
+                    logger.warning(
+                        f"Dropping '{name}' — conflicts with other notables in target list"
+                    )
+                    target_ids.remove(nid)
+                    matched[:] = [m for m in matched if f"#{nid}" not in m]
+            elif ban:
+                # Keystone is the only approach — ban conflicting nodes from the tree
+                banned = 0
+                for nid, info in self.node_info.items():
+                    if info.get("ascendancy") or info.get("is_mastery"):
+                        continue
+                    if any(kw in info.get("stats_text", "") for kw in cf_stats):
+                        extra_forbidden.add(nid)
+                        banned += 1
+                ks_names = [self.node_info.get(n, {}).get("name", str(n)) for n in ks_ids]
+                logger.info(
+                    f"Keystone conflict: {ks_names} active — "
+                    f"banned {banned} incompatible nodes from pathfinding and padding"
                 )
-                target_ids.remove(nid)
-                matched[:] = [m for m in matched if f"#{nid}" not in m]
-        else:
-            # Only RT/EO — forbid every crit node so padding never touches them
-            banned = 0
-            for nid, info in self.node_info.items():
-                if info.get("ascendancy") or info.get("is_mastery"):
-                    continue
-                stats = info.get("stats_text", "")
-                if any(kw in stats for kw in self._CRIT_STAT_KEYWORDS):
-                    extra_forbidden.add(nid)
-                    banned += 1
-            ks_names = [self.node_info.get(n, {}).get("name", str(n)) for n in no_crit_ids]
-            logger.info(
-                f"Keystone conflict: {ks_names} active — "
-                f"banned {banned} crit nodes from pathfinding and padding"
-            )
 
     def _node_traversal_cost(self, node_id: int,
                               damage_type: str = "",

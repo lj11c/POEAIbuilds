@@ -459,11 +459,16 @@ KEYSTONE_CONFLICTS = {
         "bad_passive_keywords": ["crit", "critical"],
         "reason": "Resolute Technique makes attacks never crit — crit scaling is wasted",
     },
+    "ghost reaver": {
+        "bad_passive_keywords": ["maximum life", "life leech"],
+        "reason": "Ghost Reaver converts leech to ES — life investment and life leech notables are wasted",
+    },
     "chaos inoculation": {
         "bad_jewel_mods": [
             "maximum life",
             "increased maximum life",
         ],
+        "bad_passive_keywords": ["maximum life", "life leech"],
         "reason": "CI sets max life to 1 — life scaling is useless",
     },
     "blood magic": {
