@@ -815,6 +815,7 @@ class PassiveTree:
         info = self.node_info.get(node_id, {})
         stats = info.get("stats_text", "")
         cost = 1.0
+        primary_match = False
 
         dt = damage_type.lower()
         wt = weapon_type.lower()
@@ -823,24 +824,31 @@ class PassiveTree:
         # Reward nodes whose stats match the build's damage type
         if dt and dt in stats:
             cost *= 0.5
+            primary_match = True
         if "elemental" in stats and dt in ("fire", "cold", "lightning", "elemental"):
             cost *= 0.6
+            primary_match = True
         # Reward weapon-type matches
         if wt and wt in stats:
             cost *= 0.65
+            primary_match = True
         # Reward attack/spell style matches
         if "spell" in st or "caster" in st:
             if "spell" in stats or "cast" in stats:
                 cost *= 0.6
+                primary_match = True
         elif "attack" in st and "attack" in stats:
             cost *= 0.65
+            primary_match = True
 
-        # Slight preference for universally good stats
-        if any(g in stats for g in ("life", "energy shield", "damage", "resistance", "critical")):
+        # Slight preference for universally defensive/offensive stats
+        # Use specific terms — "life" alone is too broad and catches leech nodes
+        if any(g in stats for g in ("maximum life", "energy shield", "resistance", "critical strike")):
             cost *= 0.85
 
-        # Notables are worth routing through
-        if info.get("is_notable"):
+        # Notable bonus only when the notable actually has relevant stats —
+        # a notable with no matching stats is no better than a small passive
+        if info.get("is_notable") and primary_match:
             cost *= 0.75
 
         return max(cost, 0.2)
@@ -1085,9 +1093,11 @@ class PassiveTree:
             stat_score = self._node_traversal_cost(
                 nid, damage_type, weapon_type, attack_style
             )
-            # Type bonus
-            if info.get("is_notable"):
-                type_bonus = -3.0
+            # Type bonus — only reward notables that have relevant stats
+            # (stat_score already reflects relevance; a generic type bonus
+            #  would pull in unrelated notables like Conduit or Solipsism)
+            if info.get("is_notable") and stat_score < 0.9:
+                type_bonus = -1.0  # modest bonus for relevant notables only
             elif info.get("is_jewel_socket"):
                 type_bonus = -1.5
             else:
