@@ -670,6 +670,11 @@ class PassiveTree:
                 "while dual wielding", "two handed weapon", "two-handed",
             ])
 
+        # ── Archetype conflicts ───────────────────────────────────────────
+        # Minion nodes are useless on non-summoner builds
+        if "minion" not in attack_style.lower() and "minion" not in weapon_type.lower():
+            conflict_keywords.extend(["minion", "minions"])
+
         if not conflict_keywords:
             return set()
 
@@ -724,7 +729,22 @@ class PassiveTree:
             "keystone_stats": ["maximum life becomes 1"],  # Chaos Inoculation
             "conflict_stats": ["maximum life"],
             "ban_from_padding": True,
-            # True = drop the conflicting life notables; CI is the intentional choice
+            "keystone_takes_precedence": True,
+        },
+        {
+            # CI makes low life impossible (1/1 = 100% life always)
+            # Pain Attunement and other low-life nodes are permanently inactive
+            "keystone_stats": ["maximum life becomes 1"],
+            "conflict_stats": ["when on low life", "while on low life"],
+            "ban_from_padding": True,
+            "keystone_takes_precedence": True,
+        },
+        {
+            # Mind Over Matter routes damage through mana to life —
+            # with CI your life is 1, any mana overflow is lethal
+            "keystone_stats": ["maximum life becomes 1"],
+            "conflict_stats": ["taken from mana before life"],
+            "ban_from_padding": True,
             "keystone_takes_precedence": True,
         },
     ]
