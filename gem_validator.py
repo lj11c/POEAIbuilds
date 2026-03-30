@@ -440,6 +440,7 @@ KEYSTONE_CONFLICTS = {
             "critical strike multiplier",
             "critical strike chance",
         ],
+        "bad_passive_keywords": ["crit", "critical"],
         "reason": "Elemental Overload sets crit multiplier to 0 — crit scaling is wasted",
     },
     "resolute technique": {
@@ -453,6 +454,9 @@ KEYSTONE_CONFLICTS = {
             "critical strike multiplier",
             "critical strike chance",
         ],
+        # Notable/keystone names whose presence alongside RT is contradictory.
+        # RT makes crits impossible, so any crit-scaling notable is wasted.
+        "bad_passive_keywords": ["crit", "critical"],
         "reason": "Resolute Technique makes attacks never crit — crit scaling is wasted",
     },
     "chaos inoculation": {
@@ -771,6 +775,24 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
     keystones = set()
     for name in build_data.get("passive_notables", []):
         keystones.add(name.lower())
+
+    # ── Remove passive notables that contradict active keystones ─────────
+    for ks_name, rules in KEYSTONE_CONFLICTS.items():
+        bad_kw = rules.get("bad_passive_keywords", [])
+        if not bad_kw or ks_name not in keystones:
+            continue
+        notables = build_data.get("passive_notables", [])
+        removed = [n for n in notables
+                   if n.lower() != ks_name
+                   and any(kw in n.lower() for kw in bad_kw)]
+        if removed:
+            build_data["passive_notables"] = [n for n in notables if n not in removed]
+            for n in removed:
+                fixes.append({
+                    "type": "passive",
+                    "severity": "fixed",
+                    "message": f"Removed passive '{n}' — contradicts {ks_name.title()} ({rules['reason']})",
+                })
 
     # ── Enforce user constraints (no totems/mines/traps/minions) ────────
     if user_constraints:

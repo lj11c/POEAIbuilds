@@ -694,6 +694,69 @@ class PassiveTree:
                      f"(weapon={weapon_type}, style={attack_style})")
         return conflicting
 
+    # ── Keystone mutual-exclusion rules ──────────────────────────────────────
+    # Stats text patterns that identify a keystone as "no-crit" or "crit-reliant"
+    _NO_CRIT_KS_STATS = [
+        "never deal critical strikes",        # Resolute Technique
+        "critical strikes do not deal extra", # Elemental Overload
+    ]
+    _CRIT_STAT_KEYWORDS = [
+        "critical strike chance",
+        "critical strike multiplier",
+    ]
+
+    def _handle_keystone_conflicts(self,
+                                    target_ids: list[int],
+                                    matched: list[str],
+                                    extra_forbidden: set[int]) -> None:
+        """
+        Detect mutually exclusive keystones in the target list and resolve them.
+
+        Rule — Resolute Technique / Elemental Overload vs crit investment:
+          • If RT/EO AND crit notables are both requested: drop RT/EO (prefer
+            keeping the more specific crit investment Claude chose).
+          • If only RT/EO is requested: add every crit node on the main tree
+            to extra_forbidden so pathfinding and padding never touch them.
+        """
+        no_crit_ids = [
+            nid for nid in target_ids
+            if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
+                   for kw in self._NO_CRIT_KS_STATS)
+        ]
+        crit_target_ids = [
+            nid for nid in target_ids
+            if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
+                   for kw in self._CRIT_STAT_KEYWORDS)
+        ]
+
+        if not no_crit_ids:
+            return  # no RT/EO — nothing to do
+
+        if crit_target_ids:
+            # Both RT/EO and crit notables requested — drop RT/EO
+            for nid in no_crit_ids:
+                name = self.node_info.get(nid, {}).get("name", str(nid))
+                logger.warning(
+                    f"Dropping '{name}' — conflicts with crit notables in target list"
+                )
+                target_ids.remove(nid)
+                matched[:] = [m for m in matched if f"#{nid}" not in m]
+        else:
+            # Only RT/EO — forbid every crit node so padding never touches them
+            banned = 0
+            for nid, info in self.node_info.items():
+                if info.get("ascendancy") or info.get("is_mastery"):
+                    continue
+                stats = info.get("stats_text", "")
+                if any(kw in stats for kw in self._CRIT_STAT_KEYWORDS):
+                    extra_forbidden.add(nid)
+                    banned += 1
+            ks_names = [self.node_info.get(n, {}).get("name", str(n)) for n in no_crit_ids]
+            logger.info(
+                f"Keystone conflict: {ks_names} active — "
+                f"banned {banned} crit nodes from pathfinding and padding"
+            )
+
     def _node_traversal_cost(self, node_id: int,
                               damage_type: str = "",
                               weapon_type: str = "",
@@ -807,6 +870,11 @@ class PassiveTree:
                 forbidden.add(nid)
 
         conflict_nodes = self.compute_conflict_nodes(weapon_type, attack_style)
+
+        # Resolve RT/EO vs crit keystone conflicts before building forbidden set.
+        # This may remove RT/EO from target_ids or ban crit nodes from the tree.
+        self._handle_keystone_conflicts(target_ids, matched, conflict_nodes)
+
         conflict_nodes -= set(target_ids)  # never block explicitly requested nodes
         forbidden.update(conflict_nodes)
 
