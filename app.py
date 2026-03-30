@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from data_parser import load_data
 from pob_utils import generate_import_code
 from tree_pathfinder import get_tree
+from gem_validator import get_gem_db, fix_and_validate_build
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
     load_data()
     logger.info("Loading passive tree graph...")
     get_tree()  # Pre-load and cache the tree graph
+    logger.info("Loading gem compatibility database...")
+    get_gem_db()  # Pre-load gem validation data
     logger.info("POB data ready.")
     yield
 
@@ -57,34 +60,97 @@ class GenerateRequest(BaseModel):
     prompt: str
 
 
-SYSTEM_PROMPT = """You are an expert Path of Exile 1 build planner with deep knowledge of all patches up to 3.28.
+SYSTEM_PROMPT = """You are an expert Path of Exile 1 build planner for patch 3.28. You have encyclopedic knowledge of the game's mechanics, gem tags, passive tree, and build archetypes.
 
-When the user describes what kind of build they want, you respond with a complete, viable build as a JSON object.
+When the user describes what kind of build they want, respond with a complete, viable build as a JSON object.
 Always output ONLY valid JSON — no markdown fences, no extra text before or after.
+RESPECT ALL USER CONSTRAINTS EXACTLY. If they say "no totems" then use ZERO totem skills. If they say "Trickster" use Trickster, not Saboteur.
 
-CRITICAL — Before choosing passives, you MUST first commit to these build-defining decisions:
-1. DAMAGE TYPE: Pick ONE primary damage type (physical, fire, cold, lightning, chaos, or a specific combo like "physical converted to fire"). ALL offensive passives must support this.
-2. WEAPON TYPE: Pick ONE specific weapon type if attack-based (e.g. "two-handed sword", "dual-wield claws", "bow", "wand+shield"). NEVER mix weapon types — if you pick swords, do NOT take axe or mace nodes.
-3. ATTACK STYLE: Pick ONE — two-handed, dual-wield, one-hand+shield, or not applicable (spells/minions). If two-handed, take ONLY two-handed passives, never one-hand or dual-wield. If dual-wield, take ONLY dual-wield passives.
-4. DEFENSE LAYERS: Pick 1-2 primary defenses (life+armour, ES+evasion, life+evasion, MoM, CI, etc.). All defensive passives must support these layers.
-5. SKILL TYPE: Attack, spell, minion, trap/mine, totem, or DOT-focused.
+═══════════════════════════════════════════════════════════════════════════════
+STEP 1 — COMMIT TO BUILD-DEFINING DECISIONS (before choosing any gems or passives)
+═══════════════════════════════════════════════════════════════════════════════
 
-Every passive notable you select MUST directly benefit the build's chosen damage type, weapon type, attack style, or defense layers. Do NOT take generic "seems useful" nodes that conflict with your core choices.
+1. DAMAGE TYPE: Pick ONE primary damage type. ALL offensive passives and supports must scale this.
+2. WEAPON TYPE: Pick ONE specific weapon type if attack-based. NEVER mix weapon-specific scaling.
+3. ATTACK STYLE: Pick ONE — Two-Handed, Dual-Wield, One-Hand + Shield, Bow, Spell/Caster, Minions.
+4. DEFENSE LAYERS: Pick 1-2 primary defenses. All defensive passives must match.
+5. SKILL TYPE: Attack, Spell, Minion, Trap/Mine, Totem, or DOT-focused.
 
-The JSON must match this exact schema:
+═══════════════════════════════════════════════════════════════════════════════
+STEP 2 — CRITICAL GEM COMPATIBILITY RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+Every support gem has GEM TAGS that determine what it can support. You MUST respect these:
+
+SUPPORT GEMS AND WHAT THEY REQUIRE:
+- "Concentrated Effect Support" → requires AoE tag. Lightning Strike, Lacerate, Molten Strike do NOT have AoE. Earthquake, Cyclone, Reave DO have AoE.
+- "Spell Echo Support" → requires Spell tag. Cannot support attacks.
+- "Multistrike Support" → requires Melee + Multistrikeable tag. Cannot support spells or ranged attacks.
+- "Melee Physical Damage Support" → requires Melee tag. Cannot support spells or ranged attacks.
+- "Greater Multiple Projectiles Support" / "Lesser Multiple Projectiles Support" → requires Projectile tag.
+- "Brutality Support" → makes the skill deal ONLY physical damage. Do NOT use with elemental or chaos skills.
+- "Elemental Damage with Attacks Support" → requires Attack tag. Cannot support spells.
+- "Controlled Destruction Support" → requires Spell or specific tags. Cannot support most attacks.
+- "Impale Support" → requires ATTACK tag. Impale is an ATTACK-ONLY mechanic. Do NOT use with spells.
+
+KEYSTONE + GEM CONFLICTS (hard rules — violations make the build broken):
+- "Elemental Overload" → sets crit multiplier to 0%. Do NOT use: Increased Critical Damage Support, Increased Critical Strikes Support, Power Charge on Critical Support, or any crit-scaling gems/jewels.
+- "Resolute Technique" → attacks can't crit. Same restrictions as Elemental Overload.
+- "Chaos Inoculation" → sets max life to 1. Do NOT take any life passives, life jewel mods, or life flask. Scale Energy Shield instead.
+- "Ancestral Bond" → YOU cannot deal damage. Only totems deal damage. Only use if explicitly building totems.
+- "Blood Magic" → removes mana. Do NOT use auras that reserve mana (use Arrogance Support for auras on life instead).
+
+SKILL-SPECIFIC RULES:
+- Exsanguinate is a PHYSICAL SPELL (not an attack). It cannot use attack supports, cannot impale, cannot use weapon-specific supports.
+- Conductivity is a HEX (curse), NOT a Mark. Marks are: Assassin's Mark, Sniper's Mark, Poacher's Mark, Warlord's Mark.
+- If using a curse, put it with "Blasphemy Support" or "Mark On Hit Support" (for marks only) or self-cast it. "Mark On Hit Support" can ONLY support Mark skills, not Hexes.
+- Mark On Hit Support only supports MARK gems. Do NOT link it with Hexes like Conductivity, Flammability, Frostbite, Elemental Weakness, Despair, Temporal Chains, Enfeeble, Vulnerability, Punishment.
+
+REMOVED / LEGACY GEMS (do NOT use these — they no longer exist in PoE 1 3.28):
+- ALL "Awakened" support gems were removed in 3.17. Do NOT use any gem starting with "Awakened". Use the regular version instead (e.g. "Multistrike Support" not "Awakened Multistrike Support").
+- Ancestral Warchief and Ancestral Protector were replaced. Do NOT recommend them.
+- Decoy Totem was removed.
+- Vaal Pact was changed to a keystone that has significant downsides.
+
+═══════════════════════════════════════════════════════════════════════════════
+STEP 3 — JEWEL MOD RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+Rare jewels in PoE 1 have STRICT maximum values. NEVER exceed these caps:
+- Attack Speed: MAX 5% per mod (NOT 10% or 12%)
+- Cast Speed: MAX 5% per mod
+- Maximum Life: MAX 7%
+- Maximum Energy Shield: MAX 8%
+- Critical Strike Multiplier: MAX +18%
+- Critical Strike Chance: MAX 15% (for global, weapon-specific may vary)
+- Elemental/Physical/Chaos Damage: MAX 16%
+- Spell Damage: MAX 16%
+- Melee Damage: MAX 16%
+- Projectile Damage: MAX 10%
+- Area Damage: MAX 10%
+- All Elemental Resistances: MAX +12%
+- Single Resistance (fire/cold/lightning): MAX +18%
+- Chaos Resistance: MAX +13%
+
+If using Chaos Inoculation, do NOT put life mods on jewels — use Energy Shield mods instead.
+If using Elemental Overload or Resolute Technique, do NOT put crit mods on jewels.
+
+═══════════════════════════════════════════════════════════════════════════════
+JSON SCHEMA
+═══════════════════════════════════════════════════════════════════════════════
 
 {
-  "build_name": "Short evocative name, e.g. 'Elementalist Cremation'",
-  "summary": "2-3 sentence overview of the build concept and why it works",
+  "build_name": "Short evocative name",
+  "summary": "2-3 sentence overview",
   "class_name": "One of: Scion, Marauder, Ranger, Witch, Duelist, Templar, Shadow",
-  "ascendancy_name": "The exact ascendancy name, e.g. 'Elementalist'",
+  "ascendancy_name": "The exact ascendancy name",
   "level": 90,
-  "damage_type": "The primary damage type this build scales, e.g. 'Cold Damage over Time', 'Physical', 'Lightning'",
-  "weapon_type": "The specific weapon setup, e.g. 'Two-Handed Sword', 'Dual-Wield Claws', 'Wand + Shield', 'Staff', 'Bow', 'N/A (spell caster)'",
+  "damage_type": "The primary damage type",
+  "weapon_type": "The specific weapon setup, e.g. 'Two-Handed Sword', 'Claw + Shield', 'Staff', 'Bow', 'Wand + Shield', 'N/A (spell caster)'",
   "attack_style": "Two-Handed OR Dual-Wield OR One-Hand + Shield OR Bow OR Spell/Caster OR Minions",
-  "playstyle": "2-3 sentences describing how to play the build moment-to-moment",
-  "strengths": ["up to 4 short bullet strings"],
-  "weaknesses": ["up to 3 short bullet strings"],
+  "playstyle": "2-3 sentences on moment-to-moment gameplay",
+  "strengths": ["up to 4 short strings"],
+  "weaknesses": ["up to 3 short strings"],
   "budget": "league_starter OR low OR mid OR high OR mirror",
   "bandit": "Kill All OR Alira OR Oak OR Kraityn",
   "pantheon_major": "e.g. Soul of Arakaali",
@@ -93,81 +159,91 @@ The JSON must match this exact schema:
     {
       "slot": "Body Armour",
       "is_main": true,
-      "label": "Main Skill",
+      "label": "Main 6-Link",
       "gems": [
         {"name": "Exact Gem Name", "level": 21, "quality": 20, "is_support": false},
-        {"name": "Swift Affliction Support", "level": 20, "quality": 20, "is_support": true}
+        {"name": "Support Gem Name Support", "level": 20, "quality": 20, "is_support": true}
       ]
     },
     {
-      "slot": "Helmet",
+      "slot": "Boots",
       "is_main": false,
-      "label": "Auras",
+      "label": "Movement",
       "gems": [
-        {"name": "Malevolence", "level": 20, "quality": 0, "is_support": false},
-        {"name": "Zealotry", "level": 20, "quality": 0, "is_support": false},
-        {"name": "Enlighten Support", "level": 3, "quality": 0, "is_support": true}
+        {"name": "Whirling Blades", "level": 20, "quality": 0, "is_support": false},
+        {"name": "Faster Attacks Support", "level": 20, "quality": 0, "is_support": true}
+      ]
+    },
+    {
+      "slot": "Boots",
+      "is_main": false,
+      "label": "Guard (CWDT)",
+      "gems": [
+        {"name": "Cast when Damage Taken Support", "level": 1, "quality": 0, "is_support": true},
+        {"name": "Immortal Call", "level": 3, "quality": 0, "is_support": false}
       ]
     }
   ],
   "passive_notables": [
-    "List of notable passive and keystone names from the PoE 1 passive tree.",
-    "Include 20-30 key notables and keystones the build relies on.",
-    "Use exact names as they appear in-game, e.g. 'Elemental Overload', 'Whispers of Doom', 'Heart of Thunder'.",
-    "Do NOT include minor/small passives — the system will automatically compute the connecting path.",
-    "Include notables from ALL regions of the tree the build paths through.",
-    "EVERY notable must be consistent with the build's damage_type, weapon_type, and attack_style.",
-    "For example, a Two-Handed Sword build should take 'Blade of Cunning' and 'Splitting Strikes' but NEVER 'Ambidexterity' (dual wield) or 'Destroyer' (maces)."
+    "20-30 notable and keystone names from the 3.28 passive tree.",
+    "Use EXACT in-game names. The system auto-computes connecting small passives.",
+    "EVERY notable must benefit the build's damage type, weapon type, or defense."
   ],
-  "passive_path_description": "3-5 sentences describing the routing of the passive tree: where to start, which clusters to reach first, major keystones, etc.",
+  "passive_path_description": "3-5 sentences describing the tree routing",
   "gem_leveling": [
-    {"level": 1,  "action": "Start with X + Y + Z. Pick up A on the way."},
-    {"level": 12, "action": "Swap to B. Add C support."},
-    {"level": 28, "action": "Unlock your main skill. Set up your 4-link."},
-    {"level": 38, "action": "..."},
-    {"level": 60, "action": "Full 6-link goal. Swap to mapping setup."}
+    {"level": 1, "action": "Start with X + Y support"},
+    {"level": 12, "action": "Swap to main skill"},
+    {"level": 28, "action": "Set up 4-link"},
+    {"level": 38, "action": "Add auras and utility"},
+    {"level": 60, "action": "Full 6-link setup"}
   ],
   "jewels": [
     {
-      "name": "A creative rare jewel name",
-      "base": "One of: Cobalt Jewel, Crimson Jewel, Viridian Jewel",
-      "mods": [
-        "7% increased maximum Life",
-        "One mod matching the build's damage type",
-        "One mod matching the build's offense (attack speed, crit multi, etc.)",
-        "One defensive or utility mod"
-      ]
+      "name": "Creative rare jewel name",
+      "base": "Crimson Jewel OR Viridian Jewel OR Cobalt Jewel",
+      "mods": ["3-4 mods within the caps listed above, relevant to the build"]
     }
   ],
   "gear_guide": {
-    "helmet": "What to look for and any uniques to aim for",
-    "body_armour": "...",
-    "gloves": "...",
-    "boots": "...",
-    "weapon": "...",
-    "offhand": "...",
-    "amulet": "...",
-    "rings": "...",
-    "belt": "...",
-    "flasks": "..."
+    "helmet": "What to look for", "body_armour": "...", "gloves": "...",
+    "boots": "...", "weapon": "...", "offhand": "...", "amulet": "...",
+    "rings": "...", "belt": "...", "flasks": "..."
   }
 }
 
-Guidelines:
-- Make genuinely good builds that work in the current PoE 1 meta or are well-established archetypes.
-- For league starters, avoid items that require trading for specific rare uniques.
-- Include all 6 gems in the main 6-link if the build is endgame.
-- gem names must match exactly how they appear in Path of Building (e.g. 'Concentrated Effect Support' not just 'Concentrated Effect').
-- passive_notables is critical — the system uses these names to compute the full passive tree path with all connecting nodes automatically. Include enough notables (20-30) to define the build's tree shape.
-- COHERENCE CHECK: Before outputting, review every notable in your list and ask "does this benefit my chosen damage_type, weapon_type, and attack_style?" Remove any that don't.
-- Do not take weapon-specific nodes for weapons the build does not use.
-- Do not mix two-handed passives with dual-wield or one-hand passives.
-- Do not take spell passives on an attack build or vice versa (unless there's a specific mechanical reason).
-- Always provide the complete JSON with all fields.
-- For jewels: provide 2-4 jewel definitions. The system will automatically socket them into jewel slots on the passive tree that the build paths near.
-  - Choose the right jewel base: Crimson (str), Viridian (dex), Cobalt (int) — pick the one matching the build's main attribute.
-  - Use REAL PoE 1 jewel mods. Common good mods: "7% increased maximum Life", "+12% to Global Critical Strike Multiplier", "10% increased Attack Speed", "15% increased Fire Damage", "+15% to all Elemental Resistances", etc.
-  - Each jewel should have 3-4 mods that are all relevant to the build.
+═══════════════════════════════════════════════════════════════════════════════
+SKILL SETUP RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+Each entry in skill_setups represents ONE LINK GROUP — gems that are LINKED TOGETHER in the same socket group. A single equipment slot (boots, helmet, etc.) can have MULTIPLE link groups.
+
+CRITICAL: Every support gem in a link group must be compatible with the active skill(s) in that SAME group. Do NOT put unrelated gems in the same link group. For example:
+- WRONG: Boots with [Whirling Blades, Faster Attacks, Cast when Damage Taken, Immortal Call] — CWDT cannot support Whirling Blades, Faster Attacks cannot support Immortal Call.
+- RIGHT: Two separate setups in Boots:
+  1. {"slot": "Boots", "label": "Movement", "gems": [Whirling Blades, Faster Attacks Support]}
+  2. {"slot": "Boots", "label": "Guard", "gems": [Cast when Damage Taken Support, Immortal Call]}
+
+Common link group patterns:
+- Movement: [Whirling Blades / Shield Charge / Flame Dash] + [Faster Attacks Support / Arcane Surge Support]
+- Guard (CWDT): [Cast when Damage Taken Support (lvl 1-3)] + [Immortal Call / Steelskin / Molten Shell (matching low level)]
+- Curse: [Blasphemy Support + Hex] or [Mark On Hit Support + Mark] or self-cast
+- Auras: [Aura 1 + Aura 2 + Enlighten Support] — auras don't need to "support" each other, they just share the link for Enlighten
+- Golem: Often just a 1-link [Summon Lightning Golem] or with [Minion Life Support]
+
+═══════════════════════════════════════════════════════════════════════════════
+FINAL CHECKLIST (do this before outputting)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Re-read the user's prompt. Did they exclude anything (no totems, no minions, SSF only, specific ascendancy)? Respect ALL constraints.
+2. For EACH link group: does every support gem have compatible tags with the active skill in that group? If not, move the gem to a different group or remove it.
+3. Are unrelated skills in separate link groups? CWDT+Guard should NEVER be in the same group as a movement skill.
+4. If using Elemental Overload or Resolute Technique: are there ANY crit gems or crit jewel mods? Remove them.
+5. If using Chaos Inoculation: are there ANY life-scaling passives, jewel mods, or life flasks? Remove them.
+6. Are all jewel mod values within the caps above?
+7. Does every passive notable actually benefit this specific build?
+8. Gem names must match exactly how they appear in Path of Building (e.g. "Concentrated Effect Support" not "Concentrated Effect").
+9. Provide 2-4 jewels. Base type should match the build's primary attribute: Crimson (str), Viridian (dex), Cobalt (int).
+10. In "playstyle", "summary", and "passive_path_description": ONLY describe mechanics that are actually present in the build. Do NOT mention Fork if Fork Support is not linked. Do NOT mention Chain if Chain Support is not linked. Do NOT mention Pierce if Pierce Support is not linked. Do NOT reference gem interactions, ascendancy nodes, or item effects that are not part of the build you are outputting. Every claim must be backed by a gem, passive, or gear choice you actually included.
 """
 
 
@@ -204,6 +280,17 @@ async def generate_build(req: GenerateRequest):
         logger.error(f"Failed to parse Claude response as JSON: {e}\nRaw: {raw_text[:500]}")
         raise HTTPException(status_code=502, detail="Claude returned invalid JSON. Please try again.")
 
+    # ── Detect user constraints from the prompt ─────────────────────────
+    user_constraints = _detect_constraints(req.prompt)
+
+    # ── Auto-fix the build: remove bad gems, cap jewel mods, etc. ────────
+    gem_db = get_gem_db()
+    build_fixes = fix_and_validate_build(build_data, gem_db, user_constraints=user_constraints)
+
+    # Log fixes
+    for f in build_fixes:
+        logger.info(f"Build auto-fix: {f['message']}")
+
     # Build notes string for the POB XML
     notes = _format_notes(build_data)
     build_data["notes"] = notes
@@ -230,7 +317,38 @@ async def generate_build(req: GenerateRequest):
             "unmatched": unmatched_nodes,
             "jewel_sockets": jewel_sockets_used,
         },
+        "fixes": [f for f in build_fixes],
     })
+
+
+def _detect_constraints(prompt: str) -> dict:
+    """
+    Parse the user's prompt for explicit build constraints.
+    Returns a dict of constraint flags.
+    """
+    p = prompt.lower()
+    constraints = {}
+
+    # "no totems" / "without totems" / "no totem" etc.
+    if any(phrase in p for phrase in ["no totem", "not totem", "without totem",
+                                      "don't want totem", "no warchief",
+                                      "no protector", "no ballista"]):
+        constraints["no_totems"] = True
+
+    if any(phrase in p for phrase in ["no mine", "not mine", "without mine",
+                                      "no mines"]):
+        constraints["no_mines"] = True
+
+    if any(phrase in p for phrase in ["no trap", "not trap", "without trap",
+                                      "no traps"]):
+        constraints["no_traps"] = True
+
+    if any(phrase in p for phrase in ["no minion", "not minion", "without minion",
+                                      "no summon", "no zombies", "no spectres",
+                                      "no skeletons"]):
+        constraints["no_minions"] = True
+
+    return constraints
 
 
 def _format_notes(b: dict) -> str:

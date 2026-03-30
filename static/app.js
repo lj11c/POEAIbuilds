@@ -62,7 +62,7 @@ async function generateBuild() {
       return;
     }
 
-    renderBuild(data.build, data.import_code, data.tree_info || {});
+    renderBuild(data.build, data.import_code, data.tree_info || {}, data.fixes || []);
     $('results').hidden = false;
 
     // Switch to overview tab
@@ -82,7 +82,7 @@ async function generateBuild() {
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
-function renderBuild(b, importCode, treeInfo) {
+function renderBuild(b, importCode, treeInfo, fixes) {
   // Header
   $('build-name').textContent = b.build_name || 'Generated Build';
   $('build-summary').textContent = b.summary || '';
@@ -114,6 +114,9 @@ function renderBuild(b, importCode, treeInfo) {
 
   // Tree info
   renderTreeInfo(treeInfo);
+
+  // Auto-fix notices
+  renderFixes(fixes || []);
 
   // Import
   $('import-code-box').value = importCode || '';
@@ -237,6 +240,18 @@ function renderNodeDebug(debug) {
     ? `<div style="font-size:0.78rem;color:#b05050;font-weight:600;margin:0.4rem 0 0.25rem">✗ ${unmatched.length} not found in tree data (not added to POB)</div>`
       + unmatched.map(n => `<div style="font-size:0.75rem;color:var(--text-dim);font-family:monospace">${escHtml(n)}</div>`).join('')
     : '';
+}
+
+function renderFixes(fixes) {
+  const banner = $('warnings-banner');
+  if (!fixes.length) { banner.hidden = true; return; }
+  banner.hidden = false;
+
+  let html = `<div class="warn-title">&#128295; Auto-Fixed ${fixes.length} Issue${fixes.length > 1 ? 's' : ''}</div>`;
+  for (const f of fixes) {
+    html += `<div class="warn-item">${escHtml(f.message)}</div>`;
+  }
+  banner.innerHTML = html;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
