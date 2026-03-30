@@ -23,6 +23,51 @@ CLASS_INFO: dict[str, dict] = {
     "Shadow":   {"classId": 6, "ascendancies": {"Assassin": 1, "Saboteur": 2, "Trickster": 3}},
 }
 
+# Reverse lookup: ascendancy name → class name
+ASCENDANCY_TO_CLASS: dict[str, str] = {}
+for _cls, _meta in CLASS_INFO.items():
+    for _asc in _meta["ascendancies"]:
+        ASCENDANCY_TO_CLASS[_asc] = _cls
+
+
+def validate_class_ascendancy(class_name: str, ascendancy_name: str) -> tuple[str, str]:
+    """
+    Validate that the ascendancy belongs to the class.
+    If mismatched, fix whichever is wrong:
+      - If the ascendancy is valid but for a different class, fix the class.
+      - If the class is valid but the ascendancy isn't one of its options, pick the first.
+    Returns (corrected_class, corrected_ascendancy).
+    """
+    class_meta = CLASS_INFO.get(class_name)
+
+    if class_meta and ascendancy_name in class_meta["ascendancies"]:
+        return class_name, ascendancy_name  # all good
+
+    # Ascendancy exists but belongs to a different class — fix the class
+    if ascendancy_name in ASCENDANCY_TO_CLASS:
+        correct_class = ASCENDANCY_TO_CLASS[ascendancy_name]
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Ascendancy '{ascendancy_name}' belongs to {correct_class}, not {class_name} — fixing class"
+        )
+        return correct_class, ascendancy_name
+
+    # Class is valid but ascendancy is garbage — pick the first ascendancy for this class
+    if class_meta:
+        first_asc = next(iter(class_meta["ascendancies"]))
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Unknown ascendancy '{ascendancy_name}' for {class_name} — defaulting to {first_asc}"
+        )
+        return class_name, first_asc
+
+    # Both are bad — default to Scion/Ascendant
+    import logging
+    logging.getLogger(__name__).warning(
+        f"Unknown class '{class_name}' and ascendancy '{ascendancy_name}' — defaulting to Scion/Ascendant"
+    )
+    return "Scion", "Ascendant"
+
 
 def _default_jewel_mods(build_data: dict) -> list[str]:
     """
@@ -93,6 +138,11 @@ def build_pob_xml(build_data: dict) -> str:
     ascendancy_name = build_data.get("ascendancy_name", "")
     level = str(build_data.get("level", 90))
 
+    # Validate class/ascendancy match — fix if Claude got it wrong
+    class_name, ascendancy_name = validate_class_ascendancy(class_name, ascendancy_name)
+    build_data["class_name"] = class_name
+    build_data["ascendancy_name"] = ascendancy_name
+
     class_meta = CLASS_INFO.get(class_name, CLASS_INFO["Scion"])
     class_id = str(class_meta["classId"])
     ascend_id = str(class_meta["ascendancies"].get(ascendancy_name, 0))
@@ -162,10 +212,11 @@ def build_pob_xml(build_data: dict) -> str:
     # Use pathfinder to compute full connected tree from notable names
     # Pass weapon_type and attack_style so the pathfinder avoids conflicting nodes
     passive_names = build_data.get("passive_notables", [])
+    damage_type = build_data.get("damage_type", "")
     weapon_type = build_data.get("weapon_type", "")
     attack_style = build_data.get("attack_style", "")
     node_ids, matched_nodes, unmatched_nodes, jewel_socket_ids = compute_allocated_nodes(
-        class_name, passive_names, weapon_type, attack_style
+        class_name, passive_names, ascendancy_name, damage_type, weapon_type, attack_style
     )
     nodes_str = ",".join(str(nid) for nid in node_ids) if node_ids else ""
 

@@ -570,6 +570,10 @@ REMOVED_GEMS = {
     "awakened spell echo support", "awakened swift affliction support",
     "awakened unbound ailments support", "awakened unleash support",
     "awakened vicious projectiles support", "awakened void manipulation support",
+    # Active skills removed from PoE 1
+    "ancestral protector",
+    "ancestral warchief",
+    "decoy totem",
 }
 
 # Map removed gem → valid replacement
@@ -773,7 +777,10 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
         _enforce_constraints(build_data, gem_db, user_constraints, fixes)
 
     # ── Replace removed gems with their valid equivalents ────────────────
-    for setup in build_data.get("skill_setups", []):
+    # First pass: swap replaceable gems, mark setups to remove if active is gone
+    setups_to_remove = []
+    for setup_idx, setup in enumerate(build_data.get("skill_setups", [])):
+        gems_to_remove = []
         for gem in setup.get("gems", []):
             gem_name = gem.get("name", "")
             gem_key = gem_name.lower().strip()
@@ -788,11 +795,12 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
                 })
                 gem["name"] = replacement
             elif gem_key in REMOVED_GEMS:
-                # No direct replacement — just flag it, will be caught if incompatible
+                # No direct replacement — remove the gem
+                gems_to_remove.append(gem)
                 fixes.append({
                     "type": "gem",
                     "severity": "fixed",
-                    "message": f"'{gem_name}' was removed from PoE 1 — no direct replacement available",
+                    "message": f"Removed '{gem_name}' — removed from PoE 1",
                 })
             elif gem_key.startswith("awakened "):
                 # Catch any Awakened gem we might have missed in the explicit list
@@ -806,6 +814,28 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
                     "message": f"Replaced '{gem_name}' with '{base_name}' (Awakened gems removed from PoE 1)",
                 })
                 gem["name"] = base_name
+
+        # Remove individual gems flagged for removal
+        for gem in gems_to_remove:
+            if gem in setup.get("gems", []):
+                setup["gems"].remove(gem)
+
+        # If setup has no active gems left (only supports), remove the entire setup
+        remaining_actives = [g for g in setup.get("gems", []) if not g.get("is_support")]
+        if not remaining_actives and setup.get("gems", []):
+            setup_label = setup.get("label", setup.get("slot", f"Setup {setup_idx+1}"))
+            sup_names = [g["name"] for g in setup.get("gems", [])]
+            fixes.append({
+                "type": "gem",
+                "severity": "fixed",
+                "message": f"Removed orphaned supports from '{setup_label}' ({', '.join(sup_names)}) — no active skill remains",
+            })
+            setups_to_remove.append(setup_idx)
+
+    # Remove entire setups flagged for removal (reverse order)
+    setups = build_data.get("skill_setups", [])
+    for i in sorted(setups_to_remove, reverse=True):
+        setups.pop(i)
 
     # ── Fix gem setups: replace incompatible supports ────────────────────
     for setup in build_data.get("skill_setups", []):

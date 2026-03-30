@@ -108,6 +108,7 @@ class PassiveTree:
             is_keystone = '"isKeystone"]= true' in block
             is_mastery = '"isMastery"]= true' in block
             is_jewel_socket = '"isJewelSocket"]= true' in block
+            is_ascendancy_start = '"isAscendancyStart"]= true' in block
             asc_m = re.search(r'"ascendancyName"\]\s*=\s*"([^"]+)"', block)
             ascendancy = asc_m.group(1) if asc_m else None
             csi_m = re.search(r'"classStartIndex"\]\s*=\s*(\d+)', block)
@@ -131,6 +132,7 @@ class PassiveTree:
                 "is_keystone": is_keystone,
                 "is_mastery": is_mastery,
                 "is_jewel_socket": is_jewel_socket,
+                "is_ascendancy_start": is_ascendancy_start,
                 "ascendancy": ascendancy,
                 "class_start_index": class_start_index,
                 "stats_text": stats_text,
@@ -198,10 +200,10 @@ class PassiveTree:
                         candidates = ids
                         break
 
-            # Prefer main-tree (non-ascendancy) nodes
+            # Only use main-tree (non-ascendancy) nodes
             main = [nid for nid in candidates
                     if not self.node_info[nid].get("ascendancy")]
-            chosen = main[0] if main else (candidates[0] if candidates else None)
+            chosen = main[0] if main else None
 
             if chosen:
                 found.append(chosen)
@@ -210,6 +212,203 @@ class PassiveTree:
                 unmatched.append(name)
 
         return found, matched, unmatched
+
+    def get_ascendancy_start_node(self, ascendancy_name: str) -> int | None:
+        """Find the start node for an ascendancy (the node with isAscendancyStart)."""
+        asc_lower = ascendancy_name.lower().strip()
+        for nid, info in self.node_info.items():
+            if (info.get("ascendancy") or "").lower() == asc_lower and \
+               info.get("name", "").lower() == asc_lower:
+                return nid
+        # Fallback: look for isAscendancyStart flag
+        for nid, info in self.node_info.items():
+            if (info.get("ascendancy") or "").lower() == asc_lower and \
+               info.get("is_ascendancy_start"):
+                return nid
+        return None
+
+    def get_ascendancy_notables(self, ascendancy_name: str) -> list[int]:
+        """Get all notable node IDs for an ascendancy."""
+        asc_lower = ascendancy_name.lower().strip()
+        return [nid for nid, info in self.node_info.items()
+                if (info.get("ascendancy") or "").lower() == asc_lower
+                and info.get("is_notable")]
+
+    def rank_ascendancy_notable(self, node_id: int,
+                                 damage_type: str = "",
+                                 weapon_type: str = "",
+                                 attack_style: str = "") -> int:
+        """
+        Score an ascendancy notable for build relevance (lower = better fit).
+        Looks at the node's stats text and matches against build parameters.
+        """
+        info = self.node_info.get(node_id, {})
+        stats = info.get("stats_text", "").lower()
+        name = info.get("name", "").lower()
+        score = 50  # neutral baseline
+
+        damage_type = damage_type.lower()
+        weapon_type = weapon_type.lower()
+        attack_style = attack_style.lower()
+
+        # ── Damage type match ──
+        if damage_type:
+            if "fire" in damage_type:
+                if "fire" in stats: score -= 20
+                if "cold" in stats and "fire" not in stats: score += 10
+                if "lightning" in stats and "fire" not in stats: score += 10
+            elif "cold" in damage_type:
+                if "cold" in stats: score -= 20
+                if "fire" in stats and "cold" not in stats: score += 10
+            elif "lightning" in damage_type:
+                if "lightning" in stats: score -= 20
+            elif "chaos" in damage_type:
+                if "chaos" in stats: score -= 20
+            elif "physical" in damage_type:
+                if "physical" in stats: score -= 20
+            # Elemental generics
+            if "elemental" in damage_type or damage_type in ("fire", "cold", "lightning"):
+                if "elemental" in stats: score -= 15
+
+        # ── Attack vs spell ──
+        if "spell" in attack_style or "caster" in attack_style:
+            if "spell" in stats or "cast" in stats: score -= 15
+            if "attack" in stats and "spell" not in stats: score += 15
+            if "melee" in stats: score += 20
+        elif "attack" in attack_style or weapon_type:
+            if "attack" in stats: score -= 10
+            if "spell" in stats and "attack" not in stats: score += 15
+            if "melee" in stats and ("melee" in weapon_type or "sword" in weapon_type
+                                      or "axe" in weapon_type or "mace" in weapon_type
+                                      or "claw" in weapon_type or "dagger" in weapon_type):
+                score -= 10
+
+        # ── Weapon type ──
+        if weapon_type:
+            if "bow" in weapon_type and "bow" in stats: score -= 10
+            if "wand" in weapon_type and "wand" in stats: score -= 10
+            if "two-handed" in weapon_type or "two handed" in weapon_type:
+                if "two-handed" in stats or "two handed" in stats: score -= 10
+
+        # ── Universal good stats (always useful) ──
+        universal = ["damage", "life", "energy shield", "resistance", "leech",
+                     "speed", "critical", "armour", "evasion"]
+        for u in universal:
+            if u in stats:
+                score -= 3
+
+        # ── Penalize very niche stats ──
+        niche = ["minion", "totem", "trap", "mine", "brand", "herald"]
+        for n in niche:
+            # Only penalize if the build doesn't use this mechanic
+            if n in stats:
+                if n not in damage_type and n not in attack_style:
+                    score += 20
+
+        return score
+
+    def auto_select_ascendancy(self, ascendancy_name: str,
+                                damage_type: str = "",
+                                weapon_type: str = "",
+                                attack_style: str = "",
+                                max_points: int = 8) -> tuple[list[int], list[str]]:
+        """
+        Automatically select and allocate the best ascendancy notables
+        for a build, filling up to max_points (default 8).
+
+        The ascendancy start node is free. Each other node costs 1 point.
+        Notables are ranked by relevance to the build's damage/weapon/style,
+        then greedily allocated from best to worst until points run out.
+
+        Returns (allocated_node_ids, matched_descriptions).
+        """
+        start_id = self.get_ascendancy_start_node(ascendancy_name)
+        if start_id is None:
+            logger.warning(f"No ascendancy start node for '{ascendancy_name}'")
+            return [], []
+
+        asc_lower = ascendancy_name.lower().strip()
+
+        # Get all notables and rank them
+        notable_ids = self.get_ascendancy_notables(ascendancy_name)
+        ranked = []
+        for nid in notable_ids:
+            score = self.rank_ascendancy_notable(nid, damage_type, weapon_type, attack_style)
+            name = self.node_info[nid]["name"]
+            ranked.append((score, nid, name))
+        ranked.sort(key=lambda x: x[0])  # best first
+
+        logger.info(f"Ascendancy '{ascendancy_name}' notables ranked: "
+                     + ", ".join(f"{name}({score})" for score, _, name in ranked))
+
+        # Greedily allocate best notables until we hit the point cap
+        allocated: set[int] = {start_id}  # free start node
+        matched: list[str] = []
+
+        for score, nid, name in ranked:
+            # Path from current allocated set to this notable
+            path = self._bfs_ascendancy(allocated, {nid}, asc_lower)
+            if path is None:
+                logger.warning(f"Cannot reach ascendancy notable '{name}' — skipping")
+                continue
+
+            # Check point cost
+            new_nodes = [n for n in path if n not in allocated]
+            points_after = (len(allocated) - 1) + len(new_nodes)
+
+            if points_after > max_points:
+                logger.info(f"Ascendancy cap: skipping '{name}' "
+                            f"(would use {points_after}/{max_points} points)")
+                continue
+
+            allocated.update(path)
+            matched.append(f"{name} → #{nid} (ascendancy)")
+
+        points_used = len(allocated) - 1
+        logger.info(f"Ascendancy '{ascendancy_name}': auto-selected {len(matched)} notables, "
+                     f"{points_used}/{max_points} points used")
+        return sorted(allocated), matched
+
+    def _bfs_ascendancy(self, sources: set[int], targets: set[int],
+                         ascendancy_name: str) -> list[int] | None:
+        """
+        Multi-source BFS within an ascendancy sub-graph only.
+        Only traverses nodes belonging to the named ascendancy.
+        """
+        visited: dict[int, int | None] = {}
+        queue: deque[int] = deque()
+
+        for s in sources:
+            visited[s] = None
+            queue.append(s)
+
+        while queue:
+            current = queue.popleft()
+            if current in targets:
+                path = []
+                node = current
+                while node is not None:
+                    path.append(node)
+                    node = visited[node]
+                path.reverse()
+                return path
+
+            for neighbor in self.graph.get(current, set()):
+                if neighbor in visited:
+                    continue
+                info = self.node_info.get(neighbor)
+                if not info:
+                    continue
+                # Only traverse nodes in this ascendancy
+                if (info.get("ascendancy") or "").lower() != ascendancy_name:
+                    continue
+                # Skip mastery nodes
+                if info.get("is_mastery"):
+                    continue
+                visited[neighbor] = current
+                queue.append(neighbor)
+
+        return None
 
     def bfs_shortest_path(self, start: int, target: int,
                           excluded: set[int] | None = None) -> list[int] | None:
@@ -343,25 +542,28 @@ class PassiveTree:
 
     def compute_build_tree(self, class_name: str,
                            target_names: list[str],
+                           ascendancy_name: str = "",
+                           damage_type: str = "",
                            weapon_type: str = "",
                            attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int]]:
         """
-        Compute the full set of allocated node IDs for a build.
+        Compute the full set of allocated node IDs for a build,
+        including both main-tree and ascendancy nodes.
 
         Args:
             class_name: e.g. "Witch"
             target_names: list of notable/keystone names to path to
+            ascendancy_name: e.g. "Elementalist" — auto-selects best ascendancy notables
+            damage_type: e.g. "Fire", "Physical" — used to rank ascendancy notables
             weapon_type: e.g. "Staff", "Two-Handed Sword" — used to filter conflicting nodes
             attack_style: e.g. "Two-Handed", "Dual-Wield" — used to filter conflicting nodes
 
         Returns:
-            (all_node_ids, matched_names, unmatched_names)
+            (all_node_ids, matched_names, unmatched_names, jewel_socket_ids)
 
-        Uses a greedy Steiner tree approximation:
-        1. Start from the class start node
-        2. Find closest unvisited target via BFS
-        3. Add all nodes on that path
-        4. Repeat from any node in the current tree
+        Uses a greedy Steiner tree approximation for the main tree,
+        then auto-selects and paths the best ascendancy notables up to
+        the 8-point cap.
         """
         # Get class start node
         class_idx = self.class_name_to_index.get(class_name, 0)
@@ -370,11 +572,34 @@ class PassiveTree:
             logger.error(f"No start node for class {class_name} (index {class_idx})")
             return [], [], target_names, []
 
-        # Resolve target names to node IDs
+        # Resolve target names to main-tree node IDs only
+        # (ascendancy notables are handled separately via auto-selection)
         target_ids, matched, unmatched = self.resolve_names(target_names)
+
+        # Filter out any ascendancy notable names from unmatched
+        # (they'll be auto-selected, so don't report them as unmatched)
+        if ascendancy_name:
+            asc_lower = ascendancy_name.lower().strip()
+            truly_unmatched = []
+            for name in unmatched:
+                key = name.lower().strip()
+                candidates = self.name_to_ids.get(key, [])
+                # Fuzzy fallback
+                if not candidates:
+                    for node_key, ids in self.name_to_ids.items():
+                        if key in node_key or node_key in key:
+                            candidates = ids
+                            break
+                is_asc = any((self.node_info[nid].get("ascendancy") or "").lower() == asc_lower
+                             for nid in candidates)
+                if not is_asc:
+                    truly_unmatched.append(name)
+            unmatched = truly_unmatched
+
         if not target_ids:
-            logger.warning("No target nodes resolved — returning empty tree")
-            return [], matched, unmatched, []
+            if not ascendancy_name:
+                logger.warning("No target nodes resolved — returning empty tree")
+                return [], matched, unmatched, []
 
         # Build set of forbidden nodes: root node + OTHER class start nodes
         # In PoE you cannot path through another class's start node
@@ -419,21 +644,175 @@ class PassiveTree:
             allocated.update(best_path)
             remaining_targets.discard(best_target)
 
-        # Find jewel sockets near the allocated path and add them + their
-        # connecting node (so the socket is actually allocated on the tree)
+        # Find jewel sockets near the allocated path and add them
+        # (do this before padding so they count toward the 120 target)
         nearby_sockets = self.find_allocated_jewel_sockets(allocated)
         for sid in nearby_sockets:
             if sid not in allocated:
-                # The socket is 1 hop from the tree — allocate it
                 allocated.add(sid)
 
-        # Remove the class start node from output — POB adds it implicitly
-        # Actually keep it — POB expects it in the node list
+        # ── Pad main tree to exactly 120 points ───────────────────────────
+        self._pad_to_target(allocated, forbidden, target_points=120)
+
+        # ── Ascendancy: auto-select best notables and fill 8 points ─────
+        if ascendancy_name:
+            asc_allocated, asc_matched = self.auto_select_ascendancy(
+                ascendancy_name,
+                damage_type=damage_type,
+                weapon_type=weapon_type,
+                attack_style=attack_style,
+            )
+            allocated.update(asc_allocated)
+            matched.extend(asc_matched)
+
+        # Also pick up any new jewel sockets from padding
+        extra_sockets = self.find_allocated_jewel_sockets(allocated)
+        for sid in extra_sockets:
+            if sid not in allocated:
+                allocated.add(sid)
+        all_sockets = set(nearby_sockets) | set(extra_sockets)
+
         result = sorted(allocated)
-        jewel_socket_ids = [s for s in nearby_sockets if s in allocated]
-        logger.info(f"Pathfinding complete: {len(result)} total nodes allocated, "
+        jewel_socket_ids = [s for s in sorted(all_sockets) if s in allocated]
+        main_count = self._count_main_nodes(result)
+        asc_count = sum(1 for nid in result if self.node_info.get(nid, {}).get("ascendancy"))
+        logger.info(f"Pathfinding complete: {len(result)} total nodes "
+                     f"({main_count} main tree + {asc_count} ascendancy), "
                      f"{len(jewel_socket_ids)} jewel sockets")
         return result, matched, unmatched, jewel_socket_ids
+
+    def _count_main_nodes(self, node_ids: list[int] | set[int]) -> int:
+        """Count allocatable main-tree nodes (no ascendancy, no mastery)."""
+        count = 0
+        for nid in node_ids:
+            info = self.node_info.get(nid, {})
+            if info.get("ascendancy") or info.get("is_mastery"):
+                continue
+            count += 1
+        return count
+
+    def _pad_to_target(self, allocated: set[int], forbidden: set[int],
+                        target_points: int = 120):
+        """
+        Expand the allocated tree outward until we reach exactly
+        target_points main-tree nodes. Uses BFS from the frontier
+        of the current tree, preferring notables and jewel sockets
+        over plain small passives.
+        """
+        current = self._count_main_nodes(allocated)
+        if current >= target_points:
+            logger.info(f"Tree already has {current}/{target_points} main-tree points — no padding needed")
+            return
+
+        needed = target_points - current
+        logger.info(f"Padding tree: {current} → {target_points} ({needed} nodes to add)")
+
+        # BFS outward from the current tree to find candidate nodes
+        # Score them: notables and jewel sockets are preferred
+        visited: set[int] = set(allocated)
+        queue: deque[int] = deque()
+
+        # Seed with all frontier neighbors
+        for nid in allocated:
+            for neighbor in self.graph.get(nid, set()):
+                if neighbor not in visited and neighbor not in forbidden:
+                    info = self.node_info.get(neighbor)
+                    if not info:
+                        continue
+                    if info.get("ascendancy") or info.get("is_mastery"):
+                        continue
+                    # Skip other class start nodes
+                    if info.get("class_start_index") is not None and neighbor not in allocated:
+                        continue
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        # Collect candidates in BFS order (closest first)
+        candidates: list[int] = []
+        while queue and len(candidates) < needed * 3:  # gather extras for sorting
+            current_node = queue.popleft()
+            candidates.append(current_node)
+
+            for neighbor in self.graph.get(current_node, set()):
+                if neighbor in visited or neighbor in forbidden:
+                    continue
+                info = self.node_info.get(neighbor)
+                if not info:
+                    continue
+                if info.get("ascendancy") or info.get("is_mastery"):
+                    continue
+                if info.get("class_start_index") is not None:
+                    continue
+                visited.add(neighbor)
+                queue.append(neighbor)
+
+        # Sort candidates: notables first, then jewel sockets, then small passives
+        # But we must maintain connectivity — add them one at a time via BFS path
+        added = 0
+        for candidate in candidates:
+            if added >= needed:
+                break
+
+            # Make sure this node connects to the current allocated set
+            info = self.node_info.get(candidate, {})
+
+            # Check if it's directly adjacent to allocated
+            neighbors = self.graph.get(candidate, set())
+            if not (neighbors & allocated):
+                # Need to path to it — find shortest path
+                path = self._bfs_to_nearest_single(allocated, candidate, forbidden)
+                if path is None:
+                    continue
+                # Only add if the whole path fits within budget
+                new_in_path = [pn for pn in path if pn not in allocated]
+                if added + len(new_in_path) > needed:
+                    continue  # skip — would overshoot
+                for pn in new_in_path:
+                    allocated.add(pn)
+                    added += 1
+            else:
+                allocated.add(candidate)
+                added += 1
+
+        final = self._count_main_nodes(allocated)
+        logger.info(f"Padding complete: {final}/{target_points} main-tree points")
+
+    def _bfs_to_nearest_single(self, sources: set[int], target: int,
+                                forbidden: set[int]) -> list[int] | None:
+        """BFS from sources to a single target, avoiding forbidden and ascendancy nodes."""
+        visited: dict[int, int | None] = {}
+        queue: deque[int] = deque()
+
+        for s in sources:
+            visited[s] = None
+            queue.append(s)
+
+        while queue:
+            current = queue.popleft()
+            if current == target:
+                path = []
+                node: int | None = current
+                while node is not None:
+                    path.append(node)
+                    node = visited[node]
+                path.reverse()
+                return [n for n in path if n not in sources]  # only new nodes
+
+            for neighbor in self.graph.get(current, set()):
+                if neighbor in visited or neighbor in forbidden:
+                    continue
+                info = self.node_info.get(neighbor)
+                if info and info.get("ascendancy"):
+                    continue
+                if info and info.get("is_mastery"):
+                    continue
+                if info and info.get("class_start_index") is not None:
+                    if neighbor not in sources and neighbor != target:
+                        continue
+                visited[neighbor] = current
+                queue.append(neighbor)
+
+        return None
 
     def _bfs_to_nearest(self, sources: set[int],
                         targets: set[int],
@@ -497,11 +876,15 @@ def get_tree() -> PassiveTree:
 
 def compute_allocated_nodes(class_name: str,
                             notable_names: list[str],
+                            ascendancy_name: str = "",
+                            damage_type: str = "",
                             weapon_type: str = "",
                             attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int]]:
     """
-    High-level API: given a class and target notables, return
+    High-level API: given a class, ascendancy, and target notables, return
     (full_node_id_list, matched_names, unmatched_names, jewel_socket_ids).
+    Ascendancy notables are auto-selected based on build parameters.
     """
     tree = get_tree()
-    return tree.compute_build_tree(class_name, notable_names, weapon_type, attack_style)
+    return tree.compute_build_tree(class_name, notable_names, ascendancy_name,
+                                   damage_type, weapon_type, attack_style)

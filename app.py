@@ -18,8 +18,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import re
+
 from data_parser import load_data
-from pob_utils import generate_import_code
+from pob_utils import generate_import_code, CLASS_INFO, ASCENDANCY_TO_CLASS
 from tree_pathfinder import get_tree
 from gem_validator import get_gem_db, fix_and_validate_build
 
@@ -64,7 +66,11 @@ SYSTEM_PROMPT = """You are an expert Path of Exile 1 build planner for patch 3.2
 
 When the user describes what kind of build they want, respond with a complete, viable build as a JSON object.
 Always output ONLY valid JSON — no markdown fences, no extra text before or after.
-RESPECT ALL USER CONSTRAINTS EXACTLY. If they say "no totems" then use ZERO totem skills. If they say "Trickster" use Trickster, not Saboteur.
+RESPECT ALL USER CONSTRAINTS EXACTLY:
+- If they say "Witch", use Witch — do NOT switch to Shadow or any other class even if you think another class is better.
+- If they say "Trickster", use Trickster — not Saboteur or Assassin.
+- If they say "no totems", use ZERO totem skills.
+- NEVER override the user's explicit class or ascendancy choice.
 
 ═══════════════════════════════════════════════════════════════════════════════
 STEP 1 — COMMIT TO BUILD-DEFINING DECISIONS (before choosing any gems or passives)
@@ -108,8 +114,9 @@ SKILL-SPECIFIC RULES:
 
 REMOVED / LEGACY GEMS (do NOT use these — they no longer exist in PoE 1 3.28):
 - ALL "Awakened" support gems were removed in 3.17. Do NOT use any gem starting with "Awakened". Use the regular version instead (e.g. "Multistrike Support" not "Awakened Multistrike Support").
-- Ancestral Warchief and Ancestral Protector were replaced. Do NOT recommend them.
-- Decoy Totem was removed.
+- Ancestral Protector — REMOVED from the game. Do NOT use it under any circumstances.
+- Ancestral Warchief — REMOVED from the game. Do NOT use it under any circumstances.
+- Decoy Totem — REMOVED from the game. Do NOT use it.
 - Vaal Pact was changed to a keystone that has significant downsides.
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -185,7 +192,8 @@ JSON SCHEMA
     }
   ],
   "passive_notables": [
-    "20-30 notable and keystone names from the 3.28 passive tree.",
+    "20-30 notable and keystone names from the MAIN passive tree only.",
+    "Do NOT include ascendancy notables here — the system auto-selects the best ascendancy nodes based on your build parameters.",
     "Use EXACT in-game names. The system auto-computes connecting small passives.",
     "EVERY notable must benefit the build's damage type, weapon type, or defense."
   ],
@@ -259,7 +267,7 @@ async def generate_build(req: GenerateRequest):
     try:
         message = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": req.prompt}],
         )
@@ -268,24 +276,78 @@ async def generate_build(req: GenerateRequest):
         raise HTTPException(status_code=502, detail=f"Claude API error: {str(e)}")
 
     raw_text = message.content[0].text.strip()
+    logger.info(f"Claude response length: {len(raw_text)} chars, stop_reason: {message.stop_reason}")
 
     # Strip any accidental markdown fences
     if raw_text.startswith("```"):
         raw_text = raw_text.split("\n", 1)[1]
         raw_text = raw_text.rsplit("```", 1)[0].strip()
 
+    # Try to extract JSON if Claude added text before/after it
+    if not raw_text.startswith("{"):
+        json_start = raw_text.find("{")
+        if json_start != -1:
+            raw_text = raw_text[json_start:]
+    if not raw_text.endswith("}"):
+        json_end = raw_text.rfind("}")
+        if json_end != -1:
+            raw_text = raw_text[:json_end + 1]
+
     try:
         build_data = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse Claude response as JSON: {e}\nRaw: {raw_text[:500]}")
+        logger.error(f"Failed to parse Claude response as JSON: {e}\nRaw start: {raw_text[:300]}\nRaw end: {raw_text[-300:]}")
         raise HTTPException(status_code=502, detail="Claude returned invalid JSON. Please try again.")
 
     # ── Detect user constraints from the prompt ─────────────────────────
     user_constraints = _detect_constraints(req.prompt)
 
+    # ── Enforce class/ascendancy if user explicitly requested one ────────
+    build_fixes = []
+    if "force_class" in user_constraints:
+        forced_class = user_constraints["force_class"]
+        if build_data.get("class_name") != forced_class:
+            old_class = build_data.get("class_name", "Unknown")
+            build_data["class_name"] = forced_class
+            build_fixes.append({
+                "type": "constraint",
+                "severity": "fixed",
+                "message": f"Changed class from '{old_class}' to '{forced_class}' — user requested {forced_class}",
+            })
+            # If ascendancy no longer valid for this class, pick the first one
+            class_meta = CLASS_INFO.get(forced_class, {})
+            valid_ascs = set(class_meta.get("ascendancies", {}).keys())
+            if build_data.get("ascendancy_name") not in valid_ascs:
+                old_asc = build_data.get("ascendancy_name", "")
+                # If user also forced an ascendancy and it's valid for this class, use it
+                if "force_ascendancy" in user_constraints and user_constraints["force_ascendancy"] in valid_ascs:
+                    new_asc = user_constraints["force_ascendancy"]
+                else:
+                    new_asc = next(iter(valid_ascs)) if valid_ascs else ""
+                build_data["ascendancy_name"] = new_asc
+                build_fixes.append({
+                    "type": "constraint",
+                    "severity": "fixed",
+                    "message": f"Changed ascendancy from '{old_asc}' to '{new_asc}' — must match {forced_class}",
+                })
+
+    if "force_ascendancy" in user_constraints and "force_class" not in user_constraints:
+        forced_asc = user_constraints["force_ascendancy"]
+        if build_data.get("ascendancy_name") != forced_asc:
+            old_asc = build_data.get("ascendancy_name", "Unknown")
+            build_data["ascendancy_name"] = forced_asc
+            # Also fix the class to match
+            correct_class = ASCENDANCY_TO_CLASS.get(forced_asc, build_data.get("class_name", "Scion"))
+            build_data["class_name"] = correct_class
+            build_fixes.append({
+                "type": "constraint",
+                "severity": "fixed",
+                "message": f"Changed ascendancy from '{old_asc}' to '{forced_asc}' — user requested {forced_asc}",
+            })
+
     # ── Auto-fix the build: remove bad gems, cap jewel mods, etc. ────────
     gem_db = get_gem_db()
-    build_fixes = fix_and_validate_build(build_data, gem_db, user_constraints=user_constraints)
+    build_fixes.extend(fix_and_validate_build(build_data, gem_db, user_constraints=user_constraints))
 
     # Log fixes
     for f in build_fixes:
@@ -299,7 +361,8 @@ async def generate_build(req: GenerateRequest):
     try:
         xml_str, import_code = generate_import_code(build_data)
     except Exception as e:
-        logger.error(f"POB generation error: {e}")
+        import traceback
+        logger.error(f"POB generation error: {e}\n{traceback.format_exc()}")
         import_code = ""
 
     # Extract pathfinder debug info (set by pob_utils during XML generation)
@@ -347,6 +410,33 @@ def _detect_constraints(prompt: str) -> dict:
                                       "no summon", "no zombies", "no spectres",
                                       "no skeletons"]):
         constraints["no_minions"] = True
+
+    # ── Detect explicit class/ascendancy requests ────────────────────────
+    CLASS_NAMES = {
+        "scion": "Scion", "marauder": "Marauder", "ranger": "Ranger",
+        "witch": "Witch", "duelist": "Duelist", "templar": "Templar", "shadow": "Shadow",
+    }
+    ASCENDANCY_NAMES = {
+        "ascendant": "Ascendant",
+        "juggernaut": "Juggernaut", "berserker": "Berserker", "chieftain": "Chieftain",
+        "deadeye": "Deadeye", "raider": "Raider", "pathfinder": "Pathfinder",
+        "occultist": "Occultist", "necromancer": "Necromancer", "elementalist": "Elementalist",
+        "slayer": "Slayer", "gladiator": "Gladiator", "champion": "Champion",
+        "inquisitor": "Inquisitor", "hierophant": "Hierophant", "guardian": "Guardian",
+        "assassin": "Assassin", "saboteur": "Saboteur", "trickster": "Trickster",
+    }
+
+    # Use word boundaries to avoid false matches (e.g. "pathfinder" in "pathfinding")
+    words = set(re.findall(r'\b\w+\b', p))
+    for key, name in CLASS_NAMES.items():
+        if key in words:
+            constraints["force_class"] = name
+            break
+
+    for key, name in ASCENDANCY_NAMES.items():
+        if key in words:
+            constraints["force_ascendancy"] = name
+            break
 
     return constraints
 
