@@ -193,6 +193,7 @@ JSON SCHEMA
   ],
   "passive_notables": [
     "20-30 notable and keystone names from the MAIN passive tree only.",
+    "ALWAYS include build-defining keystones here when relevant: Chaos Inoculation (ES builds), Resolute Technique (no-crit builds), Elemental Overload (elemental non-crit), Ghost Reaver (ES leech builds), Vaal Pact (instant leech builds), Mind Over Matter (mana shield builds), Acrobatics (dodge builds).",
     "Do NOT include ascendancy notables here — the system auto-selects the best ascendancy nodes based on your build parameters.",
     "Use EXACT in-game names. The system auto-computes connecting small passives.",
     "EVERY notable must benefit the build's damage type, weapon type, or defense."

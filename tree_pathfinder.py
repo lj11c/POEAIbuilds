@@ -710,16 +710,22 @@ class PassiveTree:
             ],
             "conflict_stats": ["critical strike chance", "critical strike multiplier"],
             "ban_from_padding": True,
+            # False = drop the keystone when conflict notables are also present
+            # (crit investment is more specific; RT is the mistake)
+            "keystone_takes_precedence": False,
         },
         {
             "keystone_stats": ["leech energy shield instead of life"],  # Ghost Reaver
             "conflict_stats": ["maximum life"],
-            "ban_from_padding": False,  # some life pool is still fine on a GR build
+            "ban_from_padding": False,
+            "keystone_takes_precedence": False,  # life notables win; GR is the mistake
         },
         {
             "keystone_stats": ["maximum life becomes 1"],  # Chaos Inoculation
             "conflict_stats": ["maximum life"],
-            "ban_from_padding": True,  # life investment is completely wasted with CI
+            "ban_from_padding": True,
+            # True = drop the conflicting life notables; CI is the intentional choice
+            "keystone_takes_precedence": True,
         },
     ]
 
@@ -752,25 +758,42 @@ class PassiveTree:
 
             conflict_target_ids = [
                 nid for nid in target_ids
-                if any(kw in self.node_info.get(nid, {}).get("stats_text", "")
-                       for kw in cf_stats)
+                if nid not in ks_ids  # never flag the keystone as its own conflict
+                and any(kw in self.node_info.get(nid, {}).get("stats_text", "")
+                        for kw in cf_stats)
             ]
 
             if conflict_target_ids:
-                # Both keystone and conflicting notables requested — drop the keystone
-                for nid in ks_ids:
-                    name = self.node_info.get(nid, {}).get("name", str(nid))
-                    logger.warning(
-                        f"Dropping '{name}' — conflicts with other notables in target list"
-                    )
-                    target_ids.remove(nid)
-                    matched[:] = [m for m in matched if f"#{nid}" not in m]
-            elif ban:
-                # Keystone is the only approach — ban conflicting nodes from the tree
+                if rule.get("keystone_takes_precedence", False):
+                    # Keystone is the intentional build choice — drop the conflicting notables
+                    for nid in conflict_target_ids:
+                        name = self.node_info.get(nid, {}).get("name", str(nid))
+                        logger.warning(
+                            f"Dropping '{name}' — conflicts with "
+                            f"{[self.node_info.get(k,{}).get('name',str(k)) for k in ks_ids]}"
+                        )
+                        if nid in target_ids:
+                            target_ids.remove(nid)
+                        matched[:] = [m for m in matched if f"#{nid}" not in m]
+                else:
+                    # Conflicting investment is more specific — drop the keystone
+                    for nid in ks_ids:
+                        name = self.node_info.get(nid, {}).get("name", str(nid))
+                        logger.warning(
+                            f"Dropping '{name}' — conflicts with other notables in target list"
+                        )
+                        target_ids.remove(nid)
+                        matched[:] = [m for m in matched if f"#{nid}" not in m]
+                    continue  # keystone dropped — no need to ban padding nodes
+
+            # Keystone remains active — ban conflicting nodes from padding if required
+            if ban:
                 banned = 0
                 for nid, info in self.node_info.items():
                     if info.get("ascendancy") or info.get("is_mastery"):
                         continue
+                    if nid in ks_ids:
+                        continue  # never ban the keystone itself
                     if any(kw in info.get("stats_text", "") for kw in cf_stats):
                         extra_forbidden.add(nid)
                         banned += 1
