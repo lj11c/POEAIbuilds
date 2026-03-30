@@ -4,17 +4,49 @@ Passive tree pathfinding engine.
 Parses the tree.lua graph and computes the shortest connected tree
 from a class start node through a set of target notable/keystone nodes.
 
-Uses a greedy Steiner-tree approximation:
-  1. Start from the class start node
-  2. Repeatedly find the closest unvisited target (BFS)
-  3. Add all nodes along that shortest path
-  4. Repeat until all targets are reached
+Uses a weighted A* Steiner-tree approximation:
+  1. Parse node positions from group/orbit/orbitIndex data in tree.lua
+  2. Score each node by stat relevance to the build (lower cost = more desirable)
+  3. Use A* (Euclidean distance heuristic + stat-based node costs) to find paths
+  4. Connect targets in greedy nearest-first order
+  5. Pad to 123 points using centroid-proximity + stat scoring
 """
 
 import re
 import os
+import math
+import heapq
 import logging
 from collections import deque
+
+# ── Orbit geometry constants (from POB PassiveTree.lua) ──────────────────────
+# Number of node slots per orbit ring (orbit index 0-6)
+SKILLS_PER_ORBIT = [1, 6, 16, 16, 40, 72, 72]
+# Tree-space radius (pixels) for each orbit ring
+ORBIT_RADII = [0, 82, 162, 335, 493, 662, 846]
+# Non-uniform placement angles (degrees) for 16-node orbits
+ORBIT_ANGLES_16 = [
+    0, 30, 45, 60, 90, 120, 135, 150,
+    180, 210, 225, 240, 270, 300, 315, 330,
+]
+# Non-uniform placement angles (degrees) for 40-node orbits
+ORBIT_ANGLES_40 = [
+    0, 10, 20, 30, 40, 45, 50, 60, 70, 80, 90, 100, 110, 120, 130, 135,
+    140, 150, 160, 170, 180, 190, 200, 210, 220, 225, 230, 240, 250, 260,
+    270, 280, 290, 300, 310, 315, 320, 330, 340, 350,
+]
+# A* heuristic divisor — rough max Euclidean distance covered per hop
+_ASTAR_HEURISTIC_SCALE = 500.0
+
+
+def _orbit_angle_deg(orbit: int, orbit_index: int) -> float:
+    """Return placement angle in degrees for a node at (orbit, orbit_index)."""
+    n = SKILLS_PER_ORBIT[orbit] if orbit < len(SKILLS_PER_ORBIT) else 1
+    if n == 16:
+        return float(ORBIT_ANGLES_16[orbit_index % 16])
+    if n == 40:
+        return float(ORBIT_ANGLES_40[orbit_index % 40])
+    return (360.0 * orbit_index / n) if n > 0 else 0.0
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +60,8 @@ class PassiveTree:
     def __init__(self):
         # node_id (int) → set of neighbor node_ids (int)
         self.graph: dict[int, set[int]] = {}
-        # node_id → {"name", "is_notable", "is_keystone", "is_mastery", "ascendancy", "class_start_index"}
+        # node_id → {name, is_notable, is_keystone, is_mastery, ascendancy,
+        #             class_start_index, group, orbit, orbit_index, stats_text}
         self.node_info: dict[int, dict] = {}
         # lowercase name → list of node_ids
         self.name_to_ids: dict[str, list[int]] = {}
@@ -36,6 +69,10 @@ class PassiveTree:
         self.class_starts: dict[int, int] = {}
         # set of jewel socket node IDs
         self.jewel_sockets: set[int] = set()
+        # group_id → {"x": float, "y": float}
+        self.groups: dict[int, dict] = {}
+        # node_id → (x, y) in tree-space coordinates
+        self.node_positions: dict[int, tuple[float, float]] = {}
         # class name (e.g. "Witch") → classStartIndex
         self.class_name_to_index: dict[str, int] = {
             "Scion": 0, "Marauder": 1, "Ranger": 2,
@@ -48,7 +85,10 @@ class PassiveTree:
         with open(filepath, encoding="utf-8") as f:
             content = f.read()
 
-        # Find the main ["nodes"] section (the last top-level one)
+        # Parse group center coordinates first (needed for position computation)
+        self._parse_groups(content)
+
+        # Find the main ["nodes"] section (rfind skips ["nodes"] inside groups)
         idx = content.rfind('["nodes"]=')
         if idx == -1:
             raise ValueError("Could not find nodes section in tree.lua")
@@ -56,10 +96,70 @@ class PassiveTree:
         brace_start = content.index("{", idx)
         self._parse_nodes(content, brace_start)
 
-        # Build undirected graph from out/in edges
+        # Compute tree-space x/y for every node using group + orbit geometry
+        self._compute_node_positions()
+
         logger.info(f"Tree loaded: {len(self.node_info)} nodes, "
-                     f"{len(self.class_starts)} class starts, "
-                     f"{len(self.name_to_ids)} unique names")
+                    f"{len(self.class_starts)} class starts, "
+                    f"{len(self.node_positions)} positioned, "
+                    f"{len(self.name_to_ids)} unique names")
+
+    def _parse_groups(self, content: str):
+        """Parse the top-level ['groups'] table to get each group's center x/y."""
+        idx = content.find('["groups"]=')
+        if idx == -1:
+            logger.warning("No ['groups'] section found — node positions unavailable")
+            return
+
+        brace_start = content.index("{", idx)
+        _, groups_end = self._extract_block(content, brace_start)
+        groups_section = content[brace_start: groups_end + 1]
+
+        group_id_re = re.compile(r'\[(\d+)\]=\s*\{')
+        pos = 1  # skip the opening brace of the outer table
+
+        while pos < len(groups_section):
+            m = group_id_re.search(groups_section, pos)
+            if not m:
+                break
+
+            group_id = int(m.group(1))
+            entry_start = groups_section.index("{", m.start())
+            entry_block, entry_end = self._extract_block(groups_section, entry_start)
+
+            x_m = re.search(r'"x"\]\s*=\s*(-?\d+(?:\.\d+)?)', entry_block)
+            y_m = re.search(r'"y"\]\s*=\s*(-?\d+(?:\.\d+)?)', entry_block)
+            if x_m and y_m:
+                self.groups[group_id] = {
+                    "x": float(x_m.group(1)),
+                    "y": float(y_m.group(1)),
+                }
+
+            pos = entry_end + 1
+
+        logger.info(f"Parsed {len(self.groups)} groups")
+
+    def _compute_node_positions(self):
+        """
+        Compute tree-space (x, y) for every node using:
+            x = group.x + sin(angle) * orbitRadius
+            y = group.y - cos(angle) * orbitRadius
+        Mirrors the calculation in POB's PassiveTree.lua ProcessNode().
+        """
+        for nid, info in self.node_info.items():
+            group_id = info.get("group")
+            if group_id is None or group_id not in self.groups:
+                continue
+            orbit = info.get("orbit", 0)
+            orbit_index = info.get("orbit_index", 0)
+            radius = ORBIT_RADII[orbit] if orbit < len(ORBIT_RADII) else 0
+            angle_rad = math.radians(_orbit_angle_deg(orbit, orbit_index))
+            gx = self.groups[group_id]["x"]
+            gy = self.groups[group_id]["y"]
+            self.node_positions[nid] = (
+                gx + math.sin(angle_rad) * radius,
+                gy - math.cos(angle_rad) * radius,
+            )
 
     def _parse_nodes(self, content: str, start: int):
         """Parse all nodes from the nodes table."""
@@ -121,6 +221,14 @@ class PassiveTree:
                 stat_strings = re.findall(r'"([^"]+)"', stats_m.group(1))
                 stats_text = " | ".join(stat_strings).lower()
 
+            # Spatial placement data (used to compute x/y positions)
+            group_m = re.search(r'"group"\]\s*=\s*(\d+)', block)
+            group_id = int(group_m.group(1)) if group_m else None
+            orbit_m = re.search(r'"orbit"\]\s*=\s*(\d+)', block)
+            orbit = int(orbit_m.group(1)) if orbit_m else 0
+            orbit_idx_m = re.search(r'"orbitIndex"\]\s*=\s*(\d+)', block)
+            orbit_index = int(orbit_idx_m.group(1)) if orbit_idx_m else 0
+
             # Track jewel sockets
             if is_jewel_socket:
                 self.jewel_sockets.add(node_id)
@@ -136,6 +244,9 @@ class PassiveTree:
                 "ascendancy": ascendancy,
                 "class_start_index": class_start_index,
                 "stats_text": stats_text,
+                "group": group_id,
+                "orbit": orbit,
+                "orbit_index": orbit_index,
             }
 
             # Index by name
@@ -474,24 +585,68 @@ class PassiveTree:
         conflict_keywords: list[str] = []
 
         # ── Weapon-type conflicts ─────────────────────────────────────────
+        # Each entry lists stat-text substrings that indicate a node is useless
+        # (or harmful) for a build using this weapon type.
+        # Covers both small-passive phrasing ("with staves") and
+        # notable/keystone phrasing ("staff attacks", "wielding a staff").
         WEAPON_CONFLICTS = {
-            "sword":  ["with axes", "with maces", "with claws", "with daggers",
-                       "with bows", "with wands", "with staves"],
-            "axe":    ["with swords", "with maces", "with claws", "with daggers",
-                       "with bows", "with wands", "with staves"],
-            "mace":   ["with swords", "with axes", "with claws", "with daggers",
-                       "with bows", "with wands", "with staves"],
-            "claw":   ["with swords", "with axes", "with maces", "with daggers",
-                       "with bows", "with wands", "with staves"],
-            "dagger": ["with swords", "with axes", "with maces", "with claws",
-                       "with bows", "with wands", "with staves"],
-            "bow":    ["with swords", "with axes", "with maces", "with claws",
-                       "with daggers", "with wands", "with staves",
+            "sword":  ["with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "axe":    ["with swords", "sword attacks", "wielding a sword",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "mace":   ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "claw":   ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "dagger": ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "bow":    ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with wands", "wand attacks", "wielding a wand",
+                       "with staves", "staff attacks", "wielding a staff",
                        "while holding a shield", "while dual wielding"],
-            "wand":   ["with swords", "with axes", "with maces", "with claws",
-                       "with daggers", "with bows", "with staves"],
-            "staff":  ["with swords", "with axes", "with maces", "with claws",
-                       "with daggers", "with bows", "with wands",
+            "wand":   ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with staves", "staff attacks", "wielding a staff"],
+            "staff":  ["with swords", "sword attacks", "wielding a sword",
+                       "with axes", "axe attacks", "wielding an axe",
+                       "with maces", "mace attacks", "wielding a mace",
+                       "with claws", "claw attacks", "wielding a claw",
+                       "with daggers", "dagger attacks", "wielding a dagger",
+                       "with bows", "bow attacks", "wielding a bow",
+                       "with wands", "wand attacks", "wielding a wand",
                        "while holding a shield", "while dual wielding"],
         }
         for wtype, conflicts in WEAPON_CONFLICTS.items():
@@ -521,11 +676,10 @@ class PassiveTree:
         # De-duplicate
         conflict_keywords = list(set(k.lower() for k in conflict_keywords))
 
-        # Scan all non-notable, non-keystone nodes for conflicting stats
+        # Scan all main-tree nodes (including notables) for conflicting stats.
+        # Explicitly-requested target notables are exempted in compute_build_tree.
         conflicting: set[int] = set()
         for nid, info in self.node_info.items():
-            if info.get("is_notable") or info.get("is_keystone"):
-                continue
             if info.get("is_mastery") or info.get("ascendancy"):
                 continue
             stats = info.get("stats_text", "")
@@ -539,6 +693,48 @@ class PassiveTree:
         logger.info(f"Conflict filter: {len(conflicting)} small passives forbidden "
                      f"(weapon={weapon_type}, style={attack_style})")
         return conflicting
+
+    def _node_traversal_cost(self, node_id: int,
+                              damage_type: str = "",
+                              weapon_type: str = "",
+                              attack_style: str = "") -> float:
+        """
+        Return the A* traversal cost for passing through this node.
+        Lower cost = more desirable path through this node.
+        Conflict nodes are forbidden upstream and never reach this function.
+        """
+        info = self.node_info.get(node_id, {})
+        stats = info.get("stats_text", "")
+        cost = 1.0
+
+        dt = damage_type.lower()
+        wt = weapon_type.lower()
+        st = attack_style.lower()
+
+        # Reward nodes whose stats match the build's damage type
+        if dt and dt in stats:
+            cost *= 0.5
+        if "elemental" in stats and dt in ("fire", "cold", "lightning", "elemental"):
+            cost *= 0.6
+        # Reward weapon-type matches
+        if wt and wt in stats:
+            cost *= 0.65
+        # Reward attack/spell style matches
+        if "spell" in st or "caster" in st:
+            if "spell" in stats or "cast" in stats:
+                cost *= 0.6
+        elif "attack" in st and "attack" in stats:
+            cost *= 0.65
+
+        # Slight preference for universally good stats
+        if any(g in stats for g in ("life", "energy shield", "damage", "resistance", "critical")):
+            cost *= 0.85
+
+        # Notables are worth routing through
+        if info.get("is_notable"):
+            cost *= 0.75
+
+        return max(cost, 0.2)
 
     def compute_build_tree(self, class_name: str,
                            target_names: list[str],
@@ -601,58 +797,53 @@ class PassiveTree:
                 logger.warning("No target nodes resolved — returning empty tree")
                 return [], matched, unmatched, []
 
-        # Build set of forbidden nodes: root node + OTHER class start nodes
-        # In PoE you cannot path through another class's start node
-        forbidden: set[int] = {-1}  # root pseudo-node
+        # Forbidden set: root pseudo-node + other class start nodes +
+        # small passives whose stats conflict with this build's weapon/style.
+        # Conflict nodes are hard-blocked (never traversed or allocated).
+        # Explicit target notables are exempted so they're always reachable.
+        forbidden: set[int] = {-1}
         for cidx, nid in self.class_starts.items():
             if cidx != class_idx:
                 forbidden.add(nid)
 
-        # Add small passives with conflicting stats to forbidden set
         conflict_nodes = self.compute_conflict_nodes(weapon_type, attack_style)
-        # Don't forbid any target nodes — the user explicitly asked for them
-        conflict_nodes -= set(target_ids)
+        conflict_nodes -= set(target_ids)  # never block explicitly requested nodes
         forbidden.update(conflict_nodes)
 
         logger.info(f"Pathfinding: {class_name} (start #{start_id}) -> "
-                     f"{len(target_ids)} targets ({len(unmatched)} unmatched), "
-                     f"{len(forbidden)} forbidden nodes")
+                    f"{len(target_ids)} targets ({len(unmatched)} unmatched), "
+                    f"{len(conflict_nodes)} forbidden conflict nodes")
 
-        # Greedy Steiner tree: keep adding closest target
+        # Greedy Steiner tree: repeatedly connect the nearest remaining target
         allocated: set[int] = {start_id}
         remaining_targets = set(target_ids)
 
         while remaining_targets:
-            best_path: list[int] | None = None
-            best_target: int | None = None
-
-            # BFS from ALL currently allocated nodes simultaneously
-            # to find the closest remaining target
-            best_path = self._bfs_to_nearest(allocated, remaining_targets, forbidden)
-
-            if best_path is None:
-                # Can't reach any remaining targets
-                unreachable = []
-                for tid in remaining_targets:
-                    info = self.node_info.get(tid, {})
-                    unreachable.append(info.get("name", str(tid)))
+            path = self._astar_to_nearest(
+                allocated, remaining_targets, forbidden,
+                damage_type, weapon_type, attack_style,
+            )
+            if path is None:
+                unreachable = [self.node_info.get(t, {}).get("name", str(t))
+                               for t in remaining_targets]
                 logger.warning(f"Cannot reach targets: {unreachable}")
                 break
-
-            # Add all nodes on the path to the allocated set
-            best_target = best_path[-1]
-            allocated.update(best_path)
+            best_target = path[-1]
+            allocated.update(path)
             remaining_targets.discard(best_target)
 
-        # Find jewel sockets near the allocated path and add them
-        # (do this before padding so they count toward the 120 target)
+        # Collect jewel sockets adjacent to the path before padding
         nearby_sockets = self.find_allocated_jewel_sockets(allocated)
         for sid in nearby_sockets:
             if sid not in allocated:
                 allocated.add(sid)
 
-        # ── Pad main tree to exactly 120 points ───────────────────────────
-        self._pad_to_target(allocated, forbidden, target_points=120)
+        # ── Pad main tree to exactly 123 points ───────────────────────────
+        self._pad_to_target(
+            allocated, forbidden, target_points=123,
+            damage_type=damage_type, weapon_type=weapon_type,
+            attack_style=attack_style, conflict_nodes=conflict_nodes,
+        )
 
         # ── Ascendancy: auto-select best notables and fill 8 points ─────
         if ascendancy_name:
@@ -692,12 +883,19 @@ class PassiveTree:
         return count
 
     def _pad_to_target(self, allocated: set[int], forbidden: set[int],
-                        target_points: int = 120):
+                        target_points: int = 123,
+                        damage_type: str = "",
+                        weapon_type: str = "",
+                        attack_style: str = "",
+                        conflict_nodes: set[int] | None = None):
         """
-        Expand the allocated tree outward until we reach exactly
-        target_points main-tree nodes. Uses BFS from the frontier
-        of the current tree, preferring notables and jewel sockets
-        over plain small passives.
+        Expand the allocated tree to target_points main-tree nodes.
+
+        Candidates are gathered by BFS from the frontier, then ranked by:
+          1. Distance to the centroid of already-allocated notables
+             (keeps padding within the build's active region)
+          2. Stat relevance score (reuses _node_traversal_cost)
+          3. Node type bonus (notables > jewel sockets > small passives)
         """
         current = self._count_main_nodes(allocated)
         if current >= target_points:
@@ -707,12 +905,25 @@ class PassiveTree:
         needed = target_points - current
         logger.info(f"Padding tree: {current} → {target_points} ({needed} nodes to add)")
 
-        # BFS outward from the current tree to find candidate nodes
-        # Score them: notables and jewel sockets are preferred
+        # Centroid of allocated notables (fallback: all allocated positioned nodes)
+        notable_positions = [
+            self.node_positions[n] for n in allocated
+            if n in self.node_positions and self.node_info.get(n, {}).get("is_notable")
+        ]
+        if not notable_positions:
+            notable_positions = [self.node_positions[n] for n in allocated
+                                  if n in self.node_positions]
+        if notable_positions:
+            cx = sum(p[0] for p in notable_positions) / len(notable_positions)
+            cy = sum(p[1] for p in notable_positions) / len(notable_positions)
+            centroid: tuple[float, float] | None = (cx, cy)
+        else:
+            centroid = None
+
+        # BFS outward to collect candidate nodes (gather 5× needed for sorting)
         visited: set[int] = set(allocated)
         queue: deque[int] = deque()
 
-        # Seed with all frontier neighbors
         for nid in allocated:
             for neighbor in self.graph.get(nid, set()):
                 if neighbor not in visited and neighbor not in forbidden:
@@ -721,19 +932,20 @@ class PassiveTree:
                         continue
                     if info.get("ascendancy") or info.get("is_mastery"):
                         continue
-                    # Skip other class start nodes
-                    if info.get("class_start_index") is not None and neighbor not in allocated:
+                    if info.get("class_start_index") is not None:
                         continue
                     visited.add(neighbor)
                     queue.append(neighbor)
 
-        # Collect candidates in BFS order (closest first)
         candidates: list[int] = []
-        while queue and len(candidates) < needed * 3:  # gather extras for sorting
-            current_node = queue.popleft()
-            candidates.append(current_node)
-
-            for neighbor in self.graph.get(current_node, set()):
+        while queue and len(candidates) < needed * 5:
+            node = queue.popleft()
+            # Never directly allocate a conflict node as padding —
+            # they may still be traversed as intermediaries during A* pathing
+            if conflict_nodes and node in conflict_nodes:
+                continue
+            candidates.append(node)
+            for neighbor in self.graph.get(node, set()):
                 if neighbor in visited or neighbor in forbidden:
                     continue
                 info = self.node_info.get(neighbor)
@@ -746,119 +958,153 @@ class PassiveTree:
                 visited.add(neighbor)
                 queue.append(neighbor)
 
-        # Sort candidates: notables first, then jewel sockets, then small passives
-        # But we must maintain connectivity — add them one at a time via BFS path
+        def pad_score(nid: int) -> float:
+            """Lower = higher priority."""
+            info = self.node_info.get(nid, {})
+            # Centroid distance: prefer nodes close to the build's active area
+            pos = self.node_positions.get(nid)
+            if pos and centroid:
+                dist_score = math.hypot(pos[0] - centroid[0], pos[1] - centroid[1]) / 2000.0
+            else:
+                dist_score = 1.0
+            # Stat relevance: reuse traversal cost (lower = better)
+            stat_score = self._node_traversal_cost(
+                nid, damage_type, weapon_type, attack_style
+            )
+            # Type bonus
+            if info.get("is_notable"):
+                type_bonus = -3.0
+            elif info.get("is_jewel_socket"):
+                type_bonus = -1.5
+            else:
+                type_bonus = 0.0
+            return dist_score + stat_score + type_bonus
+
+        candidates.sort(key=pad_score)
+
         added = 0
         for candidate in candidates:
             if added >= needed:
                 break
-
-            # Make sure this node connects to the current allocated set
-            info = self.node_info.get(candidate, {})
-
-            # Check if it's directly adjacent to allocated
-            neighbors = self.graph.get(candidate, set())
-            if not (neighbors & allocated):
-                # Need to path to it — find shortest path
-                path = self._bfs_to_nearest_single(allocated, candidate, forbidden)
-                if path is None:
-                    continue
-                # Only add if the whole path fits within budget
-                new_in_path = [pn for pn in path if pn not in allocated]
-                if added + len(new_in_path) > needed:
-                    continue  # skip — would overshoot
-                for pn in new_in_path:
-                    allocated.add(pn)
-                    added += 1
-            else:
+            if candidate in allocated:
+                continue
+            # Fast path: directly adjacent to tree
+            if self.graph.get(candidate, set()) & allocated:
                 allocated.add(candidate)
                 added += 1
+            else:
+                # Need to path to it — only add if it fits within budget
+                path = self._astar_single(
+                    allocated, candidate, forbidden,
+                    damage_type, weapon_type, attack_style,
+                )
+                if path is None:
+                    continue
+                new_nodes = [n for n in path if n not in allocated]
+                if added + len(new_nodes) > needed:
+                    continue
+                for n in new_nodes:
+                    allocated.add(n)
+                    added += 1
 
         final = self._count_main_nodes(allocated)
         logger.info(f"Padding complete: {final}/{target_points} main-tree points")
 
-    def _bfs_to_nearest_single(self, sources: set[int], target: int,
-                                forbidden: set[int]) -> list[int] | None:
-        """BFS from sources to a single target, avoiding forbidden and ascendancy nodes."""
-        visited: dict[int, int | None] = {}
-        queue: deque[int] = deque()
+    def _astar_to_nearest(self, sources: set[int],
+                           targets: set[int],
+                           forbidden: set[int],
+                           damage_type: str = "",
+                           weapon_type: str = "",
+                           attack_style: str = "") -> list[int] | None:
+        """
+        Multi-source weighted A*: find the lowest-cost path from any source
+        to any target, using Euclidean distance as heuristic and stat-based
+        node costs as edge weights. Conflict nodes are in `forbidden` and
+        are never traversed.
+        """
+        if not targets:
+            return None
+
+        # Precompute target positions for heuristic
+        target_positions = [
+            self.node_positions[t] for t in targets if t in self.node_positions
+        ]
+
+        def heuristic(nid: int) -> float:
+            pos = self.node_positions.get(nid)
+            if pos is None or not target_positions:
+                return 0.0
+            return min(
+                math.hypot(pos[0] - tp[0], pos[1] - tp[1])
+                for tp in target_positions
+            ) / _ASTAR_HEURISTIC_SCALE
+
+        g_score: dict[int, float] = {}
+        parent: dict[int, int | None] = {}
+        open_heap: list[tuple[float, float, int]] = []  # (f, g, node_id)
 
         for s in sources:
-            visited[s] = None
-            queue.append(s)
+            g_score[s] = 0.0
+            parent[s] = None
+            heapq.heappush(open_heap, (heuristic(s), 0.0, s))
 
-        while queue:
-            current = queue.popleft()
-            if current == target:
-                path = []
+        while open_heap:
+            f, g, current = heapq.heappop(open_heap)
+
+            if g > g_score.get(current, float("inf")) + 1e-9:
+                continue  # stale heap entry
+
+            if current in targets:
+                path: list[int] = []
                 node: int | None = current
                 while node is not None:
                     path.append(node)
-                    node = visited[node]
-                path.reverse()
-                return [n for n in path if n not in sources]  # only new nodes
-
-            for neighbor in self.graph.get(current, set()):
-                if neighbor in visited or neighbor in forbidden:
-                    continue
-                info = self.node_info.get(neighbor)
-                if info and info.get("ascendancy"):
-                    continue
-                if info and info.get("is_mastery"):
-                    continue
-                if info and info.get("class_start_index") is not None:
-                    if neighbor not in sources and neighbor != target:
-                        continue
-                visited[neighbor] = current
-                queue.append(neighbor)
-
-        return None
-
-    def _bfs_to_nearest(self, sources: set[int],
-                        targets: set[int],
-                        forbidden: set[int] | None = None) -> list[int] | None:
-        """
-        Multi-source BFS: find shortest path from any node in `sources`
-        to any node in `targets`, avoiding `forbidden` nodes.
-        Returns the path, or None.
-        """
-        forbidden = forbidden or set()
-        visited: dict[int, int | None] = {}  # node -> parent
-        queue: deque[int] = deque()
-
-        for s in sources:
-            visited[s] = None
-            queue.append(s)
-
-        while queue:
-            current = queue.popleft()
-
-            if current in targets:
-                # Reconstruct path from source to this target
-                path = []
-                node = current
-                while node is not None:
-                    path.append(node)
-                    node = visited[node]
+                    node = parent.get(node)
                 path.reverse()
                 return path
 
             for neighbor in self.graph.get(current, set()):
-                if neighbor in visited or neighbor in forbidden:
+                if neighbor in forbidden:
                     continue
                 info = self.node_info.get(neighbor)
                 if info and info.get("ascendancy"):
                     continue
                 if info and info.get("is_mastery"):
                     continue
-                # Skip other class start nodes (can't path through them)
                 if info and info.get("class_start_index") is not None:
                     if neighbor not in sources and neighbor not in targets:
                         continue
-                visited[neighbor] = current
-                queue.append(neighbor)
+
+                edge_cost = self._node_traversal_cost(
+                    neighbor, damage_type, weapon_type, attack_style
+                )
+                new_g = g + edge_cost
+
+                if new_g < g_score.get(neighbor, float("inf")):
+                    g_score[neighbor] = new_g
+                    parent[neighbor] = current
+                    heapq.heappush(open_heap,
+                                   (new_g + heuristic(neighbor), new_g, neighbor))
 
         return None
+
+    def _astar_single(self, sources: set[int],
+                       target: int,
+                       forbidden: set[int],
+                       damage_type: str = "",
+                       weapon_type: str = "",
+                       attack_style: str = "") -> list[int] | None:
+        """
+        A* from the source set to a single target.
+        Returns only the new nodes (those not already in sources), or None.
+        """
+        path = self._astar_to_nearest(
+            sources, {target}, forbidden,
+            damage_type, weapon_type, attack_style,
+        )
+        if path is None:
+            return None
+        return [n for n in path if n not in sources]
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────
