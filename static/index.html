@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>POE AI Build Generator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-gem">◆</span>
+        <span class="logo-text">POE AI Build Generator</span>
+      </div>
+      <div class="subtitle">Describe what you want — get a complete Path of Exile 1 build</div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── Input panel ── -->
+    <section class="input-panel">
+      <label class="input-label" for="prompt-input">What kind of build do you want?</label>
+      <div class="input-examples">
+        <span class="example-tag" data-text="League starter witch that clears maps fast on a tight budget">⚗ Budget witch league starter</span>
+        <span class="example-tag" data-text="Tanky marauder juggernaut that can do all content, doesn't die easily">🛡 Unkillable juggernaut</span>
+        <span class="example-tag" data-text="Strongest possible single-target damage shadow assassin for bossing">⚔ Assassin bossing monster</span>
+        <span class="example-tag" data-text="Fun and fast ranger pathfinder flask build for mapping">⚡ Pathfinder flask mapper</span>
+      </div>
+      <textarea
+        id="prompt-input"
+        placeholder="e.g. 'I want a league starter cold spell witch that can do endgame bosses on a budget. Prefer tanky over glass cannon.'"
+        rows="4"
+      ></textarea>
+      <button id="generate-btn" class="btn-generate">
+        <span id="btn-label">Generate Build</span>
+        <span id="btn-spinner" class="spinner" hidden></span>
+      </button>
+    </section>
+
+    <!-- ── Error banner ── -->
+    <div id="error-banner" class="error-banner" hidden></div>
+
+    <!-- ── Results panel (hidden until a build is generated) ── -->
+    <section id="results" class="results-panel" hidden>
+
+      <!-- Build header -->
+      <div class="build-header">
+        <div class="build-title-row">
+          <h1 id="build-name" class="build-name"></h1>
+          <div class="build-chips">
+            <span id="chip-class" class="chip chip-class"></span>
+            <span id="chip-asc" class="chip chip-asc"></span>
+            <span id="chip-budget" class="chip chip-budget"></span>
+          </div>
+        </div>
+        <p id="build-summary" class="build-summary"></p>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="overview">Overview</button>
+        <button class="tab-btn" data-tab="skills">Skill Links</button>
+        <button class="tab-btn" data-tab="tree">Passive Tree</button>
+        <button class="tab-btn" data-tab="leveling">Leveling</button>
+        <button class="tab-btn" data-tab="gear">Gear</button>
+        <button class="tab-btn" data-tab="import">POB Import</button>
+      </div>
+
+      <!-- ── Tab: Overview ── -->
+      <div class="tab-panel active" id="tab-overview">
+        <div class="two-col">
+          <div class="card">
+            <h3 class="card-title">Playstyle</h3>
+            <p id="playstyle-text"></p>
+          </div>
+          <div class="card">
+            <h3 class="card-title">Bandit &amp; Pantheon</h3>
+            <div class="meta-grid">
+              <span class="meta-label">Bandit:</span><span id="bandit-val"></span>
+              <span class="meta-label">Major God:</span><span id="pantheon-major-val"></span>
+              <span class="meta-label">Minor God:</span><span id="pantheon-minor-val"></span>
+            </div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="card">
+            <h3 class="card-title strengths-title">Strengths</h3>
+            <ul id="strengths-list" class="pro-con-list strengths"></ul>
+          </div>
+          <div class="card">
+            <h3 class="card-title weaknesses-title">Weaknesses</h3>
+            <ul id="weaknesses-list" class="pro-con-list weaknesses"></ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Tab: Skill Links ── -->
+      <div class="tab-panel" id="tab-skills">
+        <div id="skill-setups-container" class="skill-setups"></div>
+      </div>
+
+      <!-- ── Tab: Passive Tree ── -->
+      <div class="tab-panel" id="tab-tree">
+        <div class="card">
+          <h3 class="card-title">Tree Routing</h3>
+          <p id="passive-path-desc"></p>
+        </div>
+        <div class="card">
+          <h3 class="card-title">Key Notables &amp; Keystones</h3>
+          <div id="notables-grid" class="notables-grid"></div>
+        </div>
+        <div id="node-debug-card" class="card" hidden>
+          <h3 class="card-title" style="color:var(--text-dim)">POB Node Matching Debug</h3>
+          <p style="font-size:0.8rem;color:var(--text-dim);margin-bottom:0.5rem">
+            Shows which passive names were matched to tree node IDs (included in POB import) vs unmatched (text-only).
+          </p>
+          <div id="node-matched" style="margin-bottom:0.5rem"></div>
+          <div id="node-unmatched"></div>
+        </div>
+      </div>
+
+      <!-- ── Tab: Leveling ── -->
+      <div class="tab-panel" id="tab-leveling">
+        <div id="leveling-timeline" class="leveling-timeline"></div>
+      </div>
+
+      <!-- ── Tab: Gear ── -->
+      <div class="tab-panel" id="tab-gear">
+        <div id="gear-grid" class="gear-grid"></div>
+      </div>
+
+      <!-- ── Tab: POB Import ── -->
+      <div class="tab-panel" id="tab-import">
+        <div class="card import-card">
+          <h3 class="card-title">Path of Building Import Code</h3>
+          <p class="import-instructions">
+            Copy the code below. In Path of Building, click <strong>Import/Export Build → Import from Pastebin/Code</strong>
+            and paste this string.
+          </p>
+          <div class="import-code-wrap">
+            <textarea id="import-code-box" class="import-code-box" readonly></textarea>
+            <button id="copy-btn" class="btn-copy">Copy</button>
+          </div>
+          <div id="copy-feedback" class="copy-feedback" hidden>✓ Copied to clipboard!</div>
+          <div class="import-note">
+            <strong>Note:</strong> The passive tree will show the key notable nodes only.
+            You'll need to route the minor connecting nodes manually in POB.
+            Skill links and the full build guide are embedded in the Notes tab.
+          </div>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <footer>
+    <span>POE AI Build Generator — powered by Claude</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
