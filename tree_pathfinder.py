@@ -747,6 +747,14 @@ class PassiveTree:
             "ban_from_padding": True,
             "keystone_takes_precedence": True,
         },
+        {
+            # Iron Reflexes converts evasion to armour — destroys evasion
+            # as a defense layer. Drop IR when the build invests in evasion.
+            "keystone_stats": ["converts all evasion rating to armour"],
+            "conflict_stats": ["evasion rating"],
+            "ban_from_padding": True,
+            "keystone_takes_precedence": False,  # evasion investment wins, drop IR
+        },
     ]
 
     def _handle_keystone_conflicts(self,
@@ -861,10 +869,23 @@ class PassiveTree:
             cost *= 0.65
             primary_match = True
 
-        # Slight preference for universally defensive/offensive stats
-        # Use specific terms — "life" alone is too broad and catches leech nodes
-        if any(g in stats for g in ("maximum life", "energy shield", "resistance", "critical strike")):
+        # Slight preference for universally defensive/offensive stats.
+        # Only apply when the keyword appears in a clearly positive context —
+        # skip if it's preceded by a negation (e.g. "provides no bonus to energy shield").
+        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus")
+        for kw in ("maximum life", "energy shield", "resistance", "critical strike"):
+            idx = stats.find(kw)
+            if idx == -1:
+                continue
+            context = stats[max(0, idx - 35): idx]
+            if any(neg in context for neg in _NEGATIONS):
+                continue  # negative context — don't reward this
             cost *= 0.85
+            break
+
+        # Penalise party-only nodes — they provide no benefit in solo play
+        if "party member" in stats or "nearby allies" in stats:
+            cost *= 3.0
 
         # Notable bonus only when the notable actually has relevant stats —
         # a notable with no matching stats is no better than a small passive
