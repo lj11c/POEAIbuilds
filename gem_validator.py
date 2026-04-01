@@ -764,6 +764,31 @@ def _enforce_constraints(build_data: dict, gem_db: GemDatabase,
         setups.pop(i)
 
 
+# ── Keystone cap ─────────────────────────────────────────────────────────────
+
+# Every keystone that exists on the main passive tree
+KNOWN_KEYSTONES: set[str] = {
+    "resolute technique", "elemental overload", "chaos inoculation",
+    "ghost reaver", "vaal pact", "mind over matter", "iron reflexes",
+    "unwavering stance", "acrobatics", "phase acrobatics", "arrow dancing",
+    "eldritch battery", "magebane", "pain attunement", "ancestral bond",
+    "the agnostic", "eternal youth", "supreme ego", "imbalanced guard",
+    "crimson dance", "conduit", "blood magic", "zealot's oath",
+    "wind dancer", "ghost dance",
+}
+
+# The only combinations where two keystones genuinely reinforce each other.
+# Everything else is either redundant or actively contradictory.
+VALID_KEYSTONE_PAIRS: set[frozenset] = {
+    frozenset({"acrobatics", "phase acrobatics"}),   # phase always pairs with acrobatics
+    frozenset({"chaos inoculation", "ghost reaver"}), # CI + ES leech
+    frozenset({"chaos inoculation", "vaal pact"}),    # CI + instant leech
+    frozenset({"ghost reaver", "vaal pact"}),         # ES leech + instant
+    frozenset({"iron reflexes", "unwavering stance"}),# armour + no-dodge
+    frozenset({"acrobatics", "arrow dancing"}),       # evasion dodge + projectile evasion
+}
+
+
 # ── Build fix & validation ───────────────────────────────────────────────────
 
 def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
@@ -780,6 +805,30 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
     keystones = set()
     for name in build_data.get("passive_notables", []):
         keystones.add(name.lower())
+
+    # ── Cap keystones at 1 (or a single valid pair) ───────────────────────
+    ks_in_build = [n for n in build_data.get("passive_notables", [])
+                   if n.lower().strip() in KNOWN_KEYSTONES]
+    if len(ks_in_build) > 1:
+        ks_lower = frozenset(k.lower().strip() for k in ks_in_build)
+        # Allow exactly two keystones only when they form a known valid pair
+        is_valid_pair = (len(ks_in_build) == 2 and ks_lower in VALID_KEYSTONE_PAIRS)
+        if not is_valid_pair:
+            # Keep the first keystone listed, drop the rest
+            keep = ks_in_build[0]
+            to_drop = {k.lower().strip() for k in ks_in_build[1:]}
+            build_data["passive_notables"] = [
+                n for n in build_data.get("passive_notables", [])
+                if n.lower().strip() not in to_drop
+            ]
+            keystones -= to_drop
+            for dropped in ks_in_build[1:]:
+                fixes.append({
+                    "type": "passive",
+                    "severity": "fixed",
+                    "message": (f"Removed keystone '{dropped}' — builds are capped at 1 "
+                                f"keystone unless a known valid pair (kept '{keep}')"),
+                })
 
     # ── Remove passive notables that contradict active keystones ─────────
     for ks_name, rules in KEYSTONE_CONFLICTS.items():
