@@ -774,7 +774,7 @@ KNOWN_KEYSTONES: set[str] = {
     "eldritch battery", "magebane", "pain attunement", "ancestral bond",
     "the agnostic", "eternal youth", "supreme ego", "imbalanced guard",
     "crimson dance", "conduit", "blood magic", "zealot's oath",
-    "wind dancer", "ghost dance", "iron grip",
+    "wind dancer", "ghost dance", "iron grip", "iron will",
 }
 
 # Keystones that are only valid for specific build types.
@@ -793,6 +793,12 @@ KEYSTONE_BUILD_REQUIREMENTS: list[dict] = [
         "required_keywords": ["bow", "projectile", "ranged"],
         "fields": ["weapon_type", "attack_style"],
         "reason": "only benefits evasion against projectiles — useless without a bow/ranged build",
+    },
+    {
+        "keystone": "iron will",
+        "required_keywords": ["spell", "caster"],
+        "fields": ["attack_style", "damage_type"],
+        "reason": "makes Strength apply to spell damage — useless on attack builds",
     },
     {
         "keystone": "ancestral bond",

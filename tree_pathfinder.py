@@ -719,6 +719,18 @@ class PassiveTree:
         if "minion" not in attack_style.lower() and "minion" not in weapon_type.lower():
             conflict_keywords.extend(["minion", "minions"])
 
+        # Spell damage / cast speed nodes are useless on pure attack builds.
+        # Only block when the weapon is clearly melee or bow (never wands,
+        # which can be used with spells or attacks).
+        _MELEE_BOW_WEAPONS = ("sword", "axe", "mace", "staff", "claw", "dagger", "bow")
+        _is_spell_build = "spell" in attack_style.lower() or "caster" in attack_style.lower()
+        _is_melee_or_bow = any(w in weapon_type.lower() for w in _MELEE_BOW_WEAPONS)
+        if _is_melee_or_bow and not _is_spell_build:
+            conflict_keywords.extend([
+                "spell damage", "cast speed", "to spell",
+                "increased spell", "spell critical",
+            ])
+
         # Projectile nodes are useless on non-projectile builds.
         # Only bows and explicitly ranged/projectile attack styles use projectiles.
         _is_projectile = (
