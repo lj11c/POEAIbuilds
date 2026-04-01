@@ -604,14 +604,15 @@ class PassiveTree:
         return sorted(sockets)
 
     def compute_conflict_nodes(self, weapon_type: str = "",
-                               attack_style: str = "") -> set[int]:
+                               attack_style: str = "",
+                               damage_type: str = "") -> set[int]:
         """
         Find small passive nodes whose stats conflict with the build's
-        weapon type and attack style. Only flags non-notable, non-keystone
-        nodes so that intentional target selections are never blocked.
+        weapon type, attack style, and damage type.
         """
         weapon_type = weapon_type.lower()
         attack_style = attack_style.lower()
+        damage_type = damage_type.lower()
         conflict_keywords: list[str] = []
 
         # ── Weapon-type conflicts ─────────────────────────────────────────
@@ -743,6 +744,37 @@ class PassiveTree:
                 "projectile", "projectiles",
                 "arrow", "arrows",
             ])
+
+        # ── Damage-type conflicts ─────────────────────────────────────────
+        # Block damage nodes that are for the wrong element/type.
+        # Use careful keywords so we never block "resistance" (always useful)
+        # or generic "damage" nodes that apply to all types.
+        dt_lower = damage_type.lower()
+        _ELEMENTS = ("fire", "cold", "lightning")
+        _is_elemental = any(e in dt_lower for e in _ELEMENTS) or "elemental" in dt_lower
+
+        if "physical" in dt_lower and not _is_elemental:
+            # Pure physical build — elemental damage investment is wasted.
+            # Use specific "with attack skills" phrasing so we don't accidentally
+            # block combo notables that provide resistance + elemental damage
+            # (resistance is always valuable; the elemental part is just wasted).
+            conflict_keywords.extend([
+                "elemental damage with attack skills",
+                "elemental penetration",
+            ])
+
+        # Block off-element nodes for builds with a specific element
+        for element in _ELEMENTS:
+            if element in dt_lower:
+                # Block the other two elements' damage nodes
+                for other in _ELEMENTS:
+                    if other != element:
+                        conflict_keywords.extend([
+                            f"increased {other} damage",
+                            f"{other} penetration",
+                            f"to {other} damage",
+                        ])
+                break
 
         if not conflict_keywords:
             return set()
@@ -1168,7 +1200,7 @@ class PassiveTree:
             if cidx != class_idx:
                 forbidden.add(nid)
 
-        conflict_nodes = self.compute_conflict_nodes(weapon_type, attack_style)
+        conflict_nodes = self.compute_conflict_nodes(weapon_type, attack_style, damage_type)
 
         # Resolve RT/EO vs crit keystone conflicts before building forbidden set.
         # This may remove RT/EO from target_ids or ban crit nodes from the tree.
