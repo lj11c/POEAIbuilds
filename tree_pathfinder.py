@@ -719,6 +719,19 @@ class PassiveTree:
         if "minion" not in attack_style.lower() and "minion" not in weapon_type.lower():
             conflict_keywords.extend(["minion", "minions"])
 
+        # Projectile nodes are useless on non-projectile builds.
+        # Only bows and explicitly ranged/projectile attack styles use projectiles.
+        _is_projectile = (
+            "bow" in weapon_type.lower()
+            or "projectile" in attack_style.lower()
+            or "ranged" in attack_style.lower()
+        )
+        if not _is_projectile:
+            conflict_keywords.extend([
+                "projectile", "projectiles",
+                "arrow", "arrows",
+            ])
+
         if not conflict_keywords:
             return set()
 
@@ -997,6 +1010,7 @@ class PassiveTree:
         dt = damage_type.lower()
         wt = weapon_type.lower()
         st = attack_style.lower()
+        _is_projectile_build = "bow" in wt or "projectile" in st or "ranged" in st
 
         # Collect mastery nodes that are neighbors of any already-allocated node
         mastery_candidates: set[int] = set()
@@ -1021,6 +1035,10 @@ class PassiveTree:
             best_effect_id = None
             for eff in effects:
                 s = self._score_mastery_effect(eff["stats"], dt, wt, st)
+                # Penalize projectile/arrow effects on non-projectile builds
+                if not _is_projectile_build:
+                    if "projectile" in eff["stats"] or "arrow" in eff["stats"]:
+                        s *= 5.0
                 if s < best_score:
                     best_score = s
                     best_effect_id = eff["effect"]
