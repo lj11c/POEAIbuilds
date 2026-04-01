@@ -774,8 +774,39 @@ KNOWN_KEYSTONES: set[str] = {
     "eldritch battery", "magebane", "pain attunement", "ancestral bond",
     "the agnostic", "eternal youth", "supreme ego", "imbalanced guard",
     "crimson dance", "conduit", "blood magic", "zealot's oath",
-    "wind dancer", "ghost dance",
+    "wind dancer", "ghost dance", "iron grip",
 }
+
+# Keystones that are only valid for specific build types.
+# Each entry: keystone name → (required_keywords, fields_to_check, reason)
+# The keystone is removed if NONE of the required keywords appear in ANY
+# of the listed build_data fields.
+KEYSTONE_BUILD_REQUIREMENTS: list[dict] = [
+    {
+        "keystone": "iron grip",
+        "required_keywords": ["bow", "projectile", "ranged"],
+        "fields": ["weapon_type", "attack_style"],
+        "reason": "only benefits projectile attacks — useless on melee builds",
+    },
+    {
+        "keystone": "arrow dancing",
+        "required_keywords": ["bow", "projectile", "ranged"],
+        "fields": ["weapon_type", "attack_style"],
+        "reason": "only benefits evasion against projectiles — useless without a bow/ranged build",
+    },
+    {
+        "keystone": "ancestral bond",
+        "required_keywords": ["totem"],
+        "fields": ["attack_style", "damage_type"],
+        "reason": "prevents you dealing damage yourself — only valid on dedicated totem builds",
+    },
+    {
+        "keystone": "conduit",
+        "required_keywords": ["party", "group"],
+        "fields": ["attack_style", "damage_type", "notes"],
+        "reason": "only benefits nearby allies — useless in solo play",
+    },
+]
 
 # The only combinations where two keystones genuinely reinforce each other.
 # Everything else is either redundant or actively contradictory.
@@ -829,6 +860,26 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
                     "message": (f"Removed keystone '{dropped}' — builds are capped at 1 "
                                 f"keystone unless a known valid pair (kept '{keep}')"),
                 })
+
+    # ── Remove keystones that don't match the build type ─────────────────
+    for rule in KEYSTONE_BUILD_REQUIREMENTS:
+        ks = rule["keystone"]
+        if ks not in keystones:
+            continue
+        field_values = " ".join(
+            (build_data.get(f) or "").lower() for f in rule["fields"]
+        )
+        if not any(kw in field_values for kw in rule["required_keywords"]):
+            build_data["passive_notables"] = [
+                n for n in build_data.get("passive_notables", [])
+                if n.lower().strip() != ks
+            ]
+            keystones.discard(ks)
+            fixes.append({
+                "type": "passive",
+                "severity": "fixed",
+                "message": f"Removed keystone '{ks.title()}' — {rule['reason']}",
+            })
 
     # ── Remove passive notables that contradict active keystones ─────────
     for ks_name, rules in KEYSTONE_CONFLICTS.items():
