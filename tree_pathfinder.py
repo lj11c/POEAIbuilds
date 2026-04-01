@@ -975,6 +975,12 @@ class PassiveTree:
                 continue
             score *= 0.7
             break
+
+        # Heavily penalize threshold effects that require many allocated masteries
+        # or many stacks of a condition — these almost never pay off in practice.
+        if "if you have at least" in stats or "for each" in stats:
+            score *= 5.0
+
         return score
 
     def auto_select_masteries(self, allocated: set[int],
@@ -1023,8 +1029,34 @@ class PassiveTree:
 
         scored.sort(key=lambda x: x[0])
         selected: dict[int, int] = {}
-        for _, nid, eff_id in scored[:max_masteries]:
+        used_effect_ids: set[int] = set()
+        for _, nid, eff_id in scored:
+            if len(selected) >= max_masteries:
+                break
+            # Each effect ID can only be selected once across all mastery nodes —
+            # e.g. "+30 to maximum life" is the same effect on every life mastery
+            # and picking it multiple times wastes points.
+            if eff_id in used_effect_ids:
+                # Try the next-best effect on this mastery node that isn't taken
+                info = self.node_info.get(nid, {})
+                alt_effects = sorted(
+                    info.get("mastery_effects", []),
+                    key=lambda e: self._score_mastery_effect(e["stats"], dt, wt, st)
+                )
+                chosen_id = None
+                chosen_score = float("inf")
+                for eff in alt_effects:
+                    if eff["effect"] not in used_effect_ids:
+                        s = self._score_mastery_effect(eff["stats"], dt, wt, st)
+                        if s < 0.9:
+                            chosen_id = eff["effect"]
+                            chosen_score = s
+                        break
+                if chosen_id is None:
+                    continue  # no valid unused effect on this node
+                eff_id = chosen_id
             selected[nid] = eff_id
+            used_effect_ids.add(eff_id)
 
         if selected:
             logger.info(
