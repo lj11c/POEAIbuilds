@@ -841,6 +841,14 @@ def fix_and_validate_build(build_data: dict, gem_db: GemDatabase,
                     "message": f"Replaced '{gem_name}' with '{base_name}' (Awakened gems removed from PoE 1)",
                 })
                 gem["name"] = base_name
+            elif not gem.get("is_support") and gem_key not in gem_db.all_gem_names:
+                # Active skill doesn't exist in POB data at all — hallucinated name
+                gems_to_remove.append(gem)
+                fixes.append({
+                    "type": "gem",
+                    "severity": "fixed",
+                    "message": f"Removed '{gem_name}' — not a real PoE 1 active skill",
+                })
 
         # Remove individual gems flagged for removal
         for gem in gems_to_remove:
