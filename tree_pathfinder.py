@@ -915,13 +915,16 @@ class PassiveTree:
 
         # Slight preference for universally defensive/offensive stats.
         # Only apply when the keyword appears in a clearly positive context —
-        # skip if it's preceded by a negation (e.g. "provides no bonus to energy shield").
-        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus")
+        # skip if it's preceded by a negation or a "less/reduced" qualifier.
+        # Context window is 60 chars to catch e.g. "50% less maximum total life
+        # recovery per second from leech" where "less" is far before "leech".
+        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus",
+                      "% less", "less ", "% reduced")
         for kw in ("maximum life", "energy shield", "resistance", "critical strike"):
             idx = stats.find(kw)
             if idx == -1:
                 continue
-            context = stats[max(0, idx - 35): idx]
+            context = stats[max(0, idx - 60): idx]
             if any(neg in context for neg in _NEGATIONS):
                 continue  # negative context — don't reward this
             cost *= 0.85
@@ -929,6 +932,13 @@ class PassiveTree:
 
         # Penalise party-only nodes — they provide no benefit in solo play
         if "party member" in stats or "nearby allies" in stats:
+            cost *= 3.0
+
+        # Penalise nodes that explicitly reduce recovery/leech — these are
+        # harmful on builds that rely on those mechanics (e.g. Eternal Youth)
+        _HARMFUL = ("less life regeneration", "less maximum total life recovery",
+                    "less leech", "reduced leech rate", "less energy shield regeneration")
+        if any(h in stats for h in _HARMFUL):
             cost *= 3.0
 
         # Notable bonus only when the notable actually has relevant stats —
@@ -953,13 +963,14 @@ class PassiveTree:
                 score *= 0.4
         elif "attack" in st and "attack" in stats:
             score *= 0.5
-        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus")
+        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus",
+                      "% less", "less ", "% reduced")
         for kw in ("maximum life", "energy shield", "resistance", "critical strike",
-                   "attack speed", "cast speed", "damage"):
+                   "attack speed", "cast speed", "damage", "leech"):
             idx = stats.find(kw)
             if idx == -1:
                 continue
-            context = stats[max(0, idx - 35): idx]
+            context = stats[max(0, idx - 60): idx]
             if any(neg in context for neg in _NEGATIONS):
                 continue
             score *= 0.7
