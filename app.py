@@ -193,7 +193,7 @@ JSON SCHEMA
   ],
   "passive_notables": [
     "20-30 notable and keystone names from the MAIN passive tree only.",
-    "ALWAYS include build-defining keystones here when relevant: Chaos Inoculation (ES builds), Resolute Technique (no-crit builds), Elemental Overload (elemental non-crit), Ghost Reaver (ES leech builds), Vaal Pact (instant leech builds), Mind Over Matter (mana shield builds), Acrobatics (dodge builds).",
+    "Only include a keystone if it is ESSENTIAL to how the build functions — most builds are better served by more notables and masteries than by a keystone. Each keystone has strict requirements: Chaos Inoculation = pure ES build with zero life investment; Resolute Technique = build that cannot reliably crit AND has no crit nodes whatsoever; Elemental Overload = elemental build that intentionally avoids ALL crit investment; Ghost Reaver = ES build with an explicit energy shield leech source; Vaal Pact = build with reliable leech that specifically wants instant leech; Mind Over Matter = build with a large dedicated mana pool designed as a damage buffer; Acrobatics = evasion build that accepts losing block chance. If the build does not fully commit to a keystone's playstyle, omit it and use the points on notables instead.",
     "Do NOT include ascendancy notables here — the system auto-selects the best ascendancy nodes based on your build parameters.",
     "Use EXACT in-game names. The system auto-computes connecting small passives.",
     "EVERY notable must benefit the build's damage type, weapon type, or defense."
