@@ -1375,7 +1375,10 @@ class PassiveTree:
                 allocated.add(candidate)
                 added += 1
             else:
-                # Need to path to it — only add if it fits within budget
+                # Need to path to it — skip if travel cost is too high.
+                # More than 4 intermediary travel nodes to reach a padding
+                # candidate is inefficient: those points are better spent on
+                # nearby nodes regardless of how good the destination is.
                 path = self._astar_single(
                     allocated, candidate, forbidden,
                     damage_type, weapon_type, attack_style,
@@ -1383,6 +1386,8 @@ class PassiveTree:
                 if path is None:
                     continue
                 new_nodes = [n for n in path if n not in allocated]
+                if len(new_nodes) > 4:
+                    continue
                 if added + len(new_nodes) > needed:
                     continue
                 for n in new_nodes:
