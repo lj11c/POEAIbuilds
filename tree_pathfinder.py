@@ -229,6 +229,35 @@ class PassiveTree:
             orbit_idx_m = re.search(r'"orbitIndex"\]\s*=\s*(\d+)', block)
             orbit_index = int(orbit_idx_m.group(1)) if orbit_idx_m else 0
 
+            # Parse mastery effects list (only present on mastery nodes)
+            mastery_effects_list: list[dict] = []
+            if is_mastery:
+                me_m = re.search(r'"masteryEffects"\]\s*=\s*\{', block)
+                if me_m:
+                    me_brace = block.index("{", me_m.start())
+                    me_block, _ = self._extract_block(block, me_brace)
+                    inner_pos = 1  # skip opening brace of masteryEffects table
+                    while inner_pos < len(me_block):
+                        while inner_pos < len(me_block) and me_block[inner_pos] in " \t\n\r,":
+                            inner_pos += 1
+                        if inner_pos >= len(me_block) or me_block[inner_pos] == "}":
+                            break
+                        if me_block[inner_pos] == "{":
+                            entry_block, entry_end = self._extract_block(me_block, inner_pos)
+                            eff_id_m = re.search(r'"effect"\]\s*=\s*(\d+)', entry_block)
+                            eff_stats_m = re.search(r'"stats"\]\s*=\s*\{([^}]*)\}', entry_block)
+                            if eff_id_m:
+                                eff_id = int(eff_id_m.group(1))
+                                eff_stats = ""
+                                if eff_stats_m:
+                                    eff_stats = " | ".join(
+                                        re.findall(r'"([^"]+)"', eff_stats_m.group(1))
+                                    ).lower()
+                                mastery_effects_list.append({"effect": eff_id, "stats": eff_stats})
+                            inner_pos = entry_end + 1
+                        else:
+                            inner_pos += 1
+
             # Track jewel sockets
             if is_jewel_socket:
                 self.jewel_sockets.add(node_id)
@@ -244,6 +273,7 @@ class PassiveTree:
                 "ascendancy": ascendancy,
                 "class_start_index": class_start_index,
                 "stats_text": stats_text,
+                "mastery_effects": mastery_effects_list,
                 "group": group_id,
                 "orbit": orbit,
                 "orbit_index": orbit_index,
@@ -654,16 +684,30 @@ class PassiveTree:
                 conflict_keywords.extend(conflicts)
                 break
 
-        # ── Attack-style conflicts ────────────────────────────────────────
-        if "two-handed" in attack_style or "two handed" in attack_style:
-            conflict_keywords.extend([
-                "while holding a shield", "while dual wielding",
-                "block chance with shield",
-            ])
+        # ── Attack-style / weapon-type conflicts ─────────────────────────
+        # Two-handed weapons physically can't equip a shield — block all
+        # shield-related nodes regardless of whether attack_style was specified.
+        _is_two_handed = (
+            "two-handed" in attack_style or "two handed" in attack_style
+            or "two-handed" in weapon_type or "two handed" in weapon_type
+            or "staff" in weapon_type  # staves are always two-handed
+            or "bow" in weapon_type    # bows are always two-handed
+        )
+
+        _SHIELD_KEYWORDS = [
+            "while holding a shield", "while dual wielding",
+            "block chance with shield", "from equipped shield",
+            "from shield", "shield defences", "shield defence",
+            "increased defences from", "to shield",
+        ]
+
+        if _is_two_handed:
+            conflict_keywords.extend(_SHIELD_KEYWORDS)
         elif "dual" in attack_style:
             conflict_keywords.extend([
                 "while holding a shield", "two handed weapon",
                 "two-handed", "block chance with shield",
+                "from equipped shield", "from shield", "shield defences",
             ])
         elif "shield" in attack_style:
             conflict_keywords.extend([
@@ -894,12 +938,99 @@ class PassiveTree:
 
         return max(cost, 0.2)
 
+    def _score_mastery_effect(self, stats: str,
+                               dt: str, wt: str, st: str) -> float:
+        """Score a single mastery effect's stat text. Lower = better."""
+        score = 1.0
+        if dt and dt in stats:
+            score *= 0.4
+        if "elemental" in stats and dt in ("fire", "cold", "lightning", "elemental"):
+            score *= 0.5
+        if wt and wt in stats:
+            score *= 0.5
+        if "spell" in st or "caster" in st:
+            if "spell" in stats or "cast" in stats:
+                score *= 0.4
+        elif "attack" in st and "attack" in stats:
+            score *= 0.5
+        _NEGATIONS = ("provides no", "no inherent", "cannot", "never ", "no bonus")
+        for kw in ("maximum life", "energy shield", "resistance", "critical strike",
+                   "attack speed", "cast speed", "damage"):
+            idx = stats.find(kw)
+            if idx == -1:
+                continue
+            context = stats[max(0, idx - 35): idx]
+            if any(neg in context for neg in _NEGATIONS):
+                continue
+            score *= 0.7
+            break
+        return score
+
+    def auto_select_masteries(self, allocated: set[int],
+                              damage_type: str = "",
+                              weapon_type: str = "",
+                              attack_style: str = "",
+                              max_masteries: int = 8) -> dict[int, int]:
+        """
+        Find mastery nodes adjacent to any allocated node, pick the best
+        effect per mastery, and return {mastery_node_id: chosen_effect_id}.
+        Only masteries whose best effect scores below the relevance threshold
+        (0.9) are included — neutral masteries are skipped.
+        """
+        dt = damage_type.lower()
+        wt = weapon_type.lower()
+        st = attack_style.lower()
+
+        # Collect mastery nodes that are neighbors of any already-allocated node
+        mastery_candidates: set[int] = set()
+        for nid in allocated:
+            for neighbor in self.graph.get(nid, set()):
+                if neighbor in allocated:
+                    continue
+                info = self.node_info.get(neighbor)
+                if info and info.get("is_mastery"):
+                    mastery_candidates.add(neighbor)
+
+        if not mastery_candidates:
+            return {}
+
+        scored: list[tuple[float, int, int]] = []  # (best_score, node_id, effect_id)
+        for nid in mastery_candidates:
+            info = self.node_info.get(nid, {})
+            effects = info.get("mastery_effects", [])
+            if not effects:
+                continue
+            best_score = float("inf")
+            best_effect_id = None
+            for eff in effects:
+                s = self._score_mastery_effect(eff["stats"], dt, wt, st)
+                if s < best_score:
+                    best_score = s
+                    best_effect_id = eff["effect"]
+            if best_effect_id is not None and best_score < 0.9:
+                scored.append((best_score, nid, best_effect_id))
+
+        scored.sort(key=lambda x: x[0])
+        selected: dict[int, int] = {}
+        for _, nid, eff_id in scored[:max_masteries]:
+            selected[nid] = eff_id
+
+        if selected:
+            logger.info(
+                f"Mastery selection: {len(selected)} nodes chosen — "
+                + ", ".join(
+                    f"{self.node_info.get(n,{}).get('name', str(n))} eff={e}"
+                    for n, e in selected.items()
+                )
+            )
+        return selected
+
     def compute_build_tree(self, class_name: str,
                            target_names: list[str],
                            ascendancy_name: str = "",
                            damage_type: str = "",
                            weapon_type: str = "",
-                           attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int]]:
+                           attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int], dict[int, int]]:
         """
         Compute the full set of allocated node IDs for a build,
         including both main-tree and ascendancy nodes.
@@ -913,7 +1044,7 @@ class PassiveTree:
             attack_style: e.g. "Two-Handed", "Dual-Wield" — used to filter conflicting nodes
 
         Returns:
-            (all_node_ids, matched_names, unmatched_names, jewel_socket_ids)
+            (all_node_ids, matched_names, unmatched_names, jewel_socket_ids, mastery_effects)
 
         Uses a greedy Steiner tree approximation for the main tree,
         then auto-selects and paths the best ascendancy notables up to
@@ -924,7 +1055,7 @@ class PassiveTree:
         start_id = self.class_starts.get(class_idx)
         if start_id is None:
             logger.error(f"No start node for class {class_name} (index {class_idx})")
-            return [], [], target_names, []
+            return [], [], target_names, [], {}
 
         # Resolve target names to main-tree node IDs only
         # (ascendancy notables are handled separately via auto-selection)
@@ -953,7 +1084,7 @@ class PassiveTree:
         if not target_ids:
             if not ascendancy_name:
                 logger.warning("No target nodes resolved — returning empty tree")
-                return [], matched, unmatched, []
+                return [], matched, unmatched, [], {}
 
         # Forbidden set: root pseudo-node + other class start nodes +
         # small passives whose stats conflict with this build's weapon/style.
@@ -1001,9 +1132,23 @@ class PassiveTree:
             if sid not in allocated:
                 allocated.add(sid)
 
-        # ── Pad main tree to exactly 123 points ───────────────────────────
+        # ── Masteries: select from core notables before padding ───────────────
+        # Do this first so we can reduce the padding target and keep total at 123.
+        mastery_effects = self.auto_select_masteries(
+            allocated,
+            damage_type=damage_type,
+            weapon_type=weapon_type,
+            attack_style=attack_style,
+            max_masteries=8,
+        )
+        for nid in mastery_effects:
+            allocated.add(nid)
+
+        # ── Pad main tree to 123 minus mastery count ──────────────────────────
+        # _count_main_nodes excludes mastery nodes, so subtracting their count
+        # here keeps the grand total (main + mastery) at exactly 123 points.
         self._pad_to_target(
-            allocated, forbidden, target_points=123,
+            allocated, forbidden, target_points=123 - len(mastery_effects),
             damage_type=damage_type, weapon_type=weapon_type,
             attack_style=attack_style, conflict_nodes=conflict_nodes,
         )
@@ -1030,10 +1175,12 @@ class PassiveTree:
         jewel_socket_ids = [s for s in sorted(all_sockets) if s in allocated]
         main_count = self._count_main_nodes(result)
         asc_count = sum(1 for nid in result if self.node_info.get(nid, {}).get("ascendancy"))
+        mastery_count = sum(1 for nid in result if self.node_info.get(nid, {}).get("is_mastery"))
         logger.info(f"Pathfinding complete: {len(result)} total nodes "
-                     f"({main_count} main tree + {asc_count} ascendancy), "
+                     f"({main_count} main tree + {asc_count} ascendancy + "
+                     f"{mastery_count} mastery), "
                      f"{len(jewel_socket_ids)} jewel sockets")
-        return result, matched, unmatched, jewel_socket_ids
+        return result, matched, unmatched, jewel_socket_ids, mastery_effects
 
     def _count_main_nodes(self, node_ids: list[int] | set[int]) -> int:
         """Count allocatable main-tree nodes (no ascendancy, no mastery)."""
@@ -1121,28 +1268,55 @@ class PassiveTree:
                 visited.add(neighbor)
                 queue.append(neighbor)
 
+        # Pure-attribute keywords — nodes whose stats contain ONLY these
+        # provide no combat value and should be last-resort padding.
+        _ATTR_ONLY = frozenset(["strength", "dexterity", "intelligence",
+                                "to strength", "to dexterity", "to intelligence"])
+
+        def _is_pure_attribute(stats: str) -> bool:
+            """Return True if the node gives nothing but raw attributes."""
+            if not stats:
+                return False
+            # Strip all attribute phrases; if nothing meaningful remains, it's pure travel.
+            stripped = stats
+            for phrase in ("+10 to strength", "+5 to strength", "+30 to strength",
+                           "+10 to dexterity", "+5 to dexterity", "+30 to dexterity",
+                           "+10 to intelligence", "+5 to intelligence", "+30 to intelligence",
+                           "to strength", "to dexterity", "to intelligence"):
+                stripped = stripped.replace(phrase, "")
+            # If only whitespace, digits, pipes and plus signs remain → pure attribute
+            return not re.search(r'[a-z]{4,}', stripped)
+
         def pad_score(nid: int) -> float:
             """Lower = higher priority."""
             info = self.node_info.get(nid, {})
-            # Centroid distance: prefer nodes close to the build's active area
+            stats = info.get("stats_text", "")
+
+            # Centroid distance: prefer nodes close to the build's active area.
+            # Weight reduced (÷3000 instead of ÷2000) so stat relevance dominates.
             pos = self.node_positions.get(nid)
             if pos and centroid:
-                dist_score = math.hypot(pos[0] - centroid[0], pos[1] - centroid[1]) / 2000.0
+                dist_score = math.hypot(pos[0] - centroid[0], pos[1] - centroid[1]) / 3000.0
             else:
                 dist_score = 1.0
+
             # Stat relevance: reuse traversal cost (lower = better)
             stat_score = self._node_traversal_cost(
                 nid, damage_type, weapon_type, attack_style
             )
+
+            # Pure travel/attribute nodes are last-resort — heavy penalty
+            if _is_pure_attribute(stats):
+                stat_score += 1.5
+
             # Type bonus — only reward notables that have relevant stats
-            # (stat_score already reflects relevance; a generic type bonus
-            #  would pull in unrelated notables like Conduit or Solipsism)
             if info.get("is_notable") and stat_score < 0.9:
-                type_bonus = -1.0  # modest bonus for relevant notables only
+                type_bonus = -1.0
             elif info.get("is_jewel_socket"):
                 type_bonus = -1.5
             else:
                 type_bonus = 0.0
+
             return dist_score + stat_score + type_bonus
 
         candidates.sort(key=pad_score)
@@ -1290,11 +1464,12 @@ def compute_allocated_nodes(class_name: str,
                             ascendancy_name: str = "",
                             damage_type: str = "",
                             weapon_type: str = "",
-                            attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int]]:
+                            attack_style: str = "") -> tuple[list[int], list[str], list[str], list[int], dict[int, int]]:
     """
     High-level API: given a class, ascendancy, and target notables, return
-    (full_node_id_list, matched_names, unmatched_names, jewel_socket_ids).
+    (full_node_id_list, matched_names, unmatched_names, jewel_socket_ids, mastery_effects).
     Ascendancy notables are auto-selected based on build parameters.
+    mastery_effects maps mastery node_id → chosen effect_id.
     """
     tree = get_tree()
     return tree.compute_build_tree(class_name, notable_names, ascendancy_name,

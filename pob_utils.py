@@ -215,7 +215,7 @@ def build_pob_xml(build_data: dict) -> str:
     damage_type = build_data.get("damage_type", "")
     weapon_type = build_data.get("weapon_type", "")
     attack_style = build_data.get("attack_style", "")
-    node_ids, matched_nodes, unmatched_nodes, jewel_socket_ids = compute_allocated_nodes(
+    node_ids, matched_nodes, unmatched_nodes, jewel_socket_ids, mastery_effects = compute_allocated_nodes(
         class_name, passive_names, ascendancy_name, damage_type, weapon_type, attack_style
     )
     nodes_str = ",".join(str(nid) for nid in node_ids) if node_ids else ""
@@ -225,14 +225,23 @@ def build_pob_xml(build_data: dict) -> str:
     build_data["_unmatched_nodes"] = unmatched_nodes
     build_data["_total_nodes_allocated"] = len(node_ids)
     build_data["_jewel_sockets_used"] = len(jewel_socket_ids)
+    build_data["_mastery_effects_count"] = len(mastery_effects)
+
+    # Build masteryEffects attribute: "{nodeId,effectId},{nodeId,effectId},..."
+    mastery_str = ",".join(
+        f"{{{nid},{eff_id}}}" for nid, eff_id in mastery_effects.items()
+    ) if mastery_effects else ""
 
     tree_el = ET.SubElement(root, "Tree", activeSpec="1")
-    spec_el = ET.SubElement(tree_el, "Spec",
+    spec_attrs = dict(
         ascendClassId=ascend_id,
         nodes=nodes_str,
         treeVersion="3_28",
         classId=class_id,
     )
+    if mastery_str:
+        spec_attrs["masteryEffects"] = mastery_str
+    spec_el = ET.SubElement(tree_el, "Spec", **spec_attrs)
 
     # ── Jewels ────────────────────────────────────────────────────────────────
     # Generate custom rare jewels for each allocated jewel socket

@@ -16,7 +16,7 @@ notables = [
 ]
 
 print("Testing pathfinder with Witch class and 10 notables...")
-node_ids, matched, unmatched = compute_allocated_nodes("Witch", notables)
+node_ids, matched, unmatched, jewel_sockets, mastery_effects = compute_allocated_nodes("Witch", notables)
 
 print(f"\nMatched: {len(matched)}")
 for m in matched:
@@ -27,4 +27,6 @@ for u in unmatched:
     print(f"  ✗ {u}")
 
 print(f"\nTotal nodes allocated: {len(node_ids)}")
+print(f"Jewel sockets: {jewel_sockets}")
+print(f"Mastery effects: {mastery_effects}")
 print(f"Node IDs: {node_ids[:20]}{'...' if len(node_ids) > 20 else ''}")
