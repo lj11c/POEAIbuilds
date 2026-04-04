@@ -1213,7 +1213,47 @@ class PassiveTree:
                     f"{len(target_ids)} targets ({len(unmatched)} unmatched), "
                     f"{len(conflict_nodes)} forbidden conflict nodes")
 
-        # Greedy Steiner tree: repeatedly connect the nearest remaining target
+        # Pre-filter targets that are too far from the class start node.
+        # Use unweighted BFS (no forbidden nodes) to get the theoretical minimum
+        # hop distance. If a notable is more than MAX_UNWEIGHTED_HOPS away it is
+        # genuinely in the wrong part of the tree and should be skipped entirely
+        # rather than forcing a massive detour.
+        MAX_UNWEIGHTED_HOPS = 25
+        bfs_dist: dict[int, int] = {start_id: 0}
+        bfs_queue: deque[int] = deque([start_id])
+        while bfs_queue:
+            nid = bfs_queue.popleft()
+            for nb in self.graph.get(nid, set()):
+                if nb in bfs_dist:
+                    continue
+                info = self.node_info.get(nb)
+                if not info or info.get("ascendancy") or info.get("is_mastery"):
+                    continue
+                if info.get("class_start_index") is not None and nb != start_id:
+                    continue
+                bfs_dist[nb] = bfs_dist[nid] + 1
+                bfs_queue.append(nb)
+
+        filtered_targets = []
+        for tid in target_ids:
+            dist = bfs_dist.get(tid, 9999)
+            if dist > MAX_UNWEIGHTED_HOPS:
+                name = self.node_info.get(tid, {}).get("name", str(tid))
+                logger.warning(
+                    f"Skipping '{name}' — {dist} unweighted hops from class start "
+                    f"(max {MAX_UNWEIGHTED_HOPS}). Notable is in the wrong area of the tree."
+                )
+                unmatched.append(name)
+                matched[:] = [m for m in matched if f"#{tid}" not in m]
+            else:
+                filtered_targets.append(tid)
+        target_ids = filtered_targets
+
+        # Greedy Steiner tree: repeatedly connect the nearest remaining target.
+        # MAX_TRAVEL_OVERHEAD: max number of NEW nodes allowed to reach a single
+        # target. If a notable requires more than this many new nodes it's too
+        # isolated for the build — skip it rather than burning 12+ travel points.
+        MAX_TRAVEL_OVERHEAD = 12
         allocated: set[int] = {start_id}
         remaining_targets = set(target_ids)
 
@@ -1228,6 +1268,21 @@ class PassiveTree:
                 logger.warning(f"Cannot reach targets: {unreachable}")
                 break
             best_target = path[-1]
+            new_nodes = [n for n in path if n not in allocated]
+            # The last node in new_nodes is the target itself; everything before
+            # it is travel overhead. If that overhead exceeds the cap, this
+            # notable is too isolated — skip it.
+            travel_overhead = len(new_nodes) - 1
+            if travel_overhead > MAX_TRAVEL_OVERHEAD:
+                name = self.node_info.get(best_target, {}).get("name", str(best_target))
+                logger.warning(
+                    f"Skipping '{name}' — requires {travel_overhead} new travel nodes "
+                    f"(max {MAX_TRAVEL_OVERHEAD}). Too isolated for build efficiency."
+                )
+                unmatched.append(name)
+                matched[:] = [m for m in matched if f"#{best_target}" not in m]
+                remaining_targets.discard(best_target)
+                continue
             allocated.update(path)
             remaining_targets.discard(best_target)
 
