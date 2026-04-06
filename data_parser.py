@@ -230,5 +230,25 @@ def find_node_ids(names: list[str]) -> tuple[list[int], list[str], list[str]]:
 
 
 def find_gem(name: str) -> dict | None:
-    """Return gem info dict {gemId, skillId, name} for a gem name, or None."""
-    return _gem_lookup.get(name.lower().strip())
+    """Return gem info dict {gemId, skillId, name} for a gem name, or None.
+
+    Falls back to fuzzy matching (substring / prefix) when an exact match fails,
+    so minor name variations from Claude don't produce blank gemId/skillId.
+    """
+    key = name.lower().strip()
+
+    # 1. Exact match
+    if key in _gem_lookup:
+        return _gem_lookup[key]
+
+    # 2. Prefix match (e.g. "added lightning damage" → "added lightning damage support")
+    for db_key, info in _gem_lookup.items():
+        if db_key.startswith(key) or key.startswith(db_key):
+            return info
+
+    # 3. Substring match (e.g. "spell echo" → "spell echo support")
+    for db_key, info in _gem_lookup.items():
+        if key in db_key or db_key in key:
+            return info
+
+    return None

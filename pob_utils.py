@@ -181,11 +181,13 @@ def build_pob_xml(build_data: dict) -> str:
     skill_setups = build_data.get("skill_setups", [])
     for idx, setup in enumerate(skill_setups, start=1):
         slot = setup.get("slot", "Body Armour")
+        label = setup.get("label", "")
         skill_el = ET.SubElement(skills_el, "Skill",
             mainActiveSkillCalcs="1",
             enabled="true",
             slot=slot,
             mainActiveSkill="1",
+            label=label,
         )
         for gem in setup.get("gems", []):
             gem_name = gem.get("name", "")
